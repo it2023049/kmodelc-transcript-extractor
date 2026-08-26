@@ -2077,7 +2077,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--audio-device",
         choices=["auto", "cuda", "cpu"],
         default="auto",
-        help="Device passed to audio_diarize.py. Under Slurm, use auto or cuda.",
+        help="Device passed to audio_diarize.py. Use auto, cuda, or cpu as appropriate.",
     )
     audio_group.add_argument(
         "--audio-dtype",
