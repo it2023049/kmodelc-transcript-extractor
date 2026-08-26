@@ -1,0 +1,48 @@
+name: Python checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  syntax-check:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Verify expected source files
+        run: |
+          test -f chat/mass_extract.py
+          test -f chat/facebook_extract.py
+          test -f chat/viber_extract.py
+          test -f chat/extractor_utils.py
+          test -f speech/audio_diarize.py
+          test -f speech/audio_utils.py
+          test -f email/email_extract.py
+
+      - name: Compile Python files
+        run: |
+          python -m py_compile \
+            chat/mass_extract.py \
+            chat/facebook_extract.py \
+            chat/viber_extract.py \
+            chat/extractor_utils.py \
+            speech/audio_diarize.py \
+            speech/audio_utils.py \
+            email/email_extract.py

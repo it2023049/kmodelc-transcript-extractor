@@ -1,0 +1,20 @@
+# Core chat and email screenshot extraction
+numpy
+opencv-python-headless
+easyocr
+ollama
+PyPDF2
+
+# HTTP communication for Ollama and the optional MOSS API backend
+requests
+
+# Local audio transcription and speaker diarization
+# Install a PyTorch build appropriate for the target device when needed.
+torch
+torchvision
+transformers
+accelerate
+soundfile
+
+# MOSS transcription and diarization package
+moss-transcribe-diarize @ git+https://github.com/OpenMOSS/MOSS-Transcribe-Diarize.git
