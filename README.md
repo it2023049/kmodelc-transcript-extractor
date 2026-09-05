@@ -124,6 +124,7 @@ The integrated batch orchestrator. It:
 - classifies screenshots
 - runs the appropriate chat or email extractor
 - preserves conversation-level chat mapping continuity
+- optionally retains raw and polished chat-only CSV snapshots
 - writes raw and polished chat-only CSV files
 - runs the audio pipeline once for all discovered recordings
 - infers an evidence-bounded date independently for each audio file
@@ -457,11 +458,11 @@ python3 speech/audio_diarize.py \
 
 `chat/mass_extract.py` provides three modes:
 
-| Mode | Behavior |
-| --- | --- |
-| `auto` | Inspects image content first and uses filename/path evidence when the visual classifier is uncertain. |
-| `vision` | Uses visual classification and falls back to filename/path evidence when needed. |
-| `filename` | Uses filename and folder hints only. |
+| Mode       | Behavior                                                                                              |
+| ---------- | ----------------------------------------------------------------------------------------------------- |
+| `auto`     | Inspects image content first and uses filename/path evidence when the visual classifier is uncertain. |
+| `vision`   | Uses visual classification and falls back to filename/path evidence when needed.                      |
+| `filename` | Uses filename and folder hints only.                                                                  |
 
 The platform can also be forced when every candidate image belongs to one known
 type:
@@ -474,30 +475,31 @@ type:
 
 ## Useful Batch Options
 
-| Option | Purpose |
-| --- | --- |
-| `--case-report PATH` | Override automatic case-report discovery. |
-| `--output PATH` | Set the final merged CSV path. |
-| `--results-dir PATH` | Set the output root directory. |
-| `--manifest PATH` | Write a JSON run manifest. |
-| `--classify-mode MODE` | Select `auto`, `vision`, or `filename` classification. |
-| `--force-platform TYPE` | Force `facebook`, `viber`, or `email`. |
-| `--model MODEL` | Set the Ollama classification/extraction model. |
-| `--langs LANGS` | Set EasyOCR languages. |
-| `--cpu` | Use CPU mode for OCR. |
-| `--no-vision` | Disable direct image input inside the extractors. |
-| `--no-chat-polish` | Disable strict post-chat `Message` cleanup. |
-| `--chat-polish-model MODEL` | Set the message-cleanup model. |
-| `--keep-per-image` | Keep intermediate image CSV files. |
-| `--keep-audio-output` | Keep audio intermediate files. |
-| `--debug` | Keep per-image debug directories. |
-| `--dump-ocr` | Save OCR artifacts. |
-| `--dump-draft` | Save extraction drafts. |
-| `--dump-side-map` | Save provisional and final side mappings. |
-| `--audio-date DD/MM/YYYY` | Override contextual audio-date selection. |
-| `--audio-backend BACKEND` | Select local or API-based MOSS processing. |
-| `--audio-debug-json` | Save detailed audio JSON artifacts. |
-| `--keep-duplicates` | Disable exact chat/email row deduplication. |
+| Option                      | Purpose                                                                         |
+| --------------------------- | ------------------------------------------------------------------------------- |
+| `--case-report PATH`        | Override automatic case-report discovery.                                       |
+| `--output PATH`             | Set the final merged CSV path.                                                  |
+| `--results-dir PATH`        | Set the output root directory.                                                  |
+| `--manifest PATH`           | Write a JSON run manifest.                                                      |
+| `--classify-mode MODE`      | Select `auto`, `vision`, or `filename` classification.                          |
+| `--force-platform TYPE`     | Force `facebook`, `viber`, or `email`.                                          |
+| `--model MODEL`             | Set the Ollama classification/extraction model.                                 |
+| `--langs LANGS`             | Set EasyOCR languages.                                                          |
+| `--cpu`                     | Use CPU mode for OCR.                                                           |
+| `--no-vision`               | Disable direct image input inside the extractors.                               |
+| `--no-chat-polish`          | Disable strict post-chat `Message` cleanup.                                     |
+| `--chat-polish-model MODEL` | Set the message-cleanup model.                                                  |
+| `--keep-chat-stage-outputs` | Additionally retain `<package>_chat_raw.csv` and `<package>_chat_polished.csv`. |
+| `--keep-per-image`          | Keep intermediate image CSV files.                                              |
+| `--keep-audio-output`       | Keep audio intermediate files.                                                  |
+| `--debug`                   | Keep per-image debug directories.                                               |
+| `--dump-ocr`                | Save OCR artifacts.                                                             |
+| `--dump-draft`              | Save extraction drafts.                                                         |
+| `--dump-side-map`           | Save provisional and final side mappings.                                       |
+| `--audio-date DD/MM/YYYY`   | Override contextual audio-date selection.                                       |
+| `--audio-backend BACKEND`   | Select local or API-based MOSS processing.                                      |
+| `--audio-debug-json`        | Save detailed audio JSON artifacts.                                             |
+| `--keep-duplicates`         | Disable exact chat/email row deduplication.                                     |
 
 Use the built-in help for the complete option set:
 
@@ -509,21 +511,36 @@ python3 email/email_extract.py --help
 
 ## Output Files
 
-A typical retained output tree is:
+By default, the batch command retains only the final merged CSV:
 
 ```text
 results/
 ├── extracted/
-├── per_image/
-├── per_audio/
-├── <package>_chat_raw.csv
-├── <package>_chat_polished.csv
-├── <package>_merged.csv
-└── <run_manifest>.json
+└── <package>_merged.csv
 ```
 
-Only retained outputs are present. Intermediate directories may be temporary
-unless their corresponding retention flags are enabled.
+Use `--keep-chat-stage-outputs` when the pre- and post-LLM chat snapshots are
+needed for debugging, evaluation, or ablation comparisons:
+
+```bash
+python3 chat/mass_extract.py evidence_package.zip \
+  --case-report case_reports/report.pdf \
+  --keep-chat-stage-outputs
+```
+
+The retained CSV files will then be:
+
+```text
+results/
+├── <package>_chat_raw.csv
+├── <package>_chat_polished.csv
+└── <package>_merged.csv
+```
+
+The `per_image/`, `per_audio/`, and manifest entries remain optional and require
+their corresponding retention options. Supplying `--raw-chat-output` or
+`--polished-chat-output` with a custom path also enables retention of both chat
+stage CSVs.
 
 ## Status and Failure Semantics
 

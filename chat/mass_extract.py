@@ -11,6 +11,7 @@ Timestamp, Estimated_Timestamp, Sender, Receiver, Message.
 import argparse
 from collections import Counter
 import csv
+from difflib import SequenceMatcher
 import glob
 import hashlib
 import io
@@ -49,6 +50,9 @@ PER_AUDIO_DIR_NAME = "per_audio"
 EXTRACTED_ZIPS_DIR_NAME = "extracted"
 SHARED_UTILS_FILENAME = "extractor_utils.py"
 DEFAULT_AUDIO_MODEL_ID = "OpenMOSS-Team/MOSS-Transcribe-Diarize"
+AUDIO_DUPLICATE_ROW_SEQUENCE_THRESHOLD = 0.88
+AUDIO_DUPLICATE_TOKEN_CONTAINMENT_THRESHOLD = 0.85
+AUDIO_DUPLICATE_MIN_TOKENS = 8
 
 @dataclass
 class EvidenceSource:
@@ -68,6 +72,16 @@ class InputPlan:
     audio_files: List[Path]
     file_inventory: List[Dict[str, str]]
     run_stem: str
+
+@dataclass
+class AudioCandidate:
+    """One diarized audio file and the rows proposed for the merged CSV."""
+    rows: List[Dict[str, str]]
+    record: Dict[str, str]
+    source_audio: Path
+    source_csv: Path
+    order: int
+    sha256: str = ""
 
 # ============================================================
 # PATH / INPUT HELPERS
@@ -140,6 +154,15 @@ def resolve_output_path(path_value: Optional[str], base_dir: Path, default_name:
     if path.is_absolute():
         return path
     return base_dir / path
+
+
+def should_keep_chat_csvs(args: argparse.Namespace) -> bool:
+    """Retain both chat checkpoints only after an explicit CLI request."""
+    return bool(
+        args.keep_chat_csvs
+        or args.raw_chat_output is not None
+        or args.polished_chat_output is not None
+    )
 
 def list_files_recursively(root: Path) -> List[Path]:
     """Returns all files under a folder, skipping common metadata/cache folders."""
@@ -1377,6 +1400,259 @@ def normalize_message_for_dedupe(message: str) -> str:
     text = re.sub(r"\s+", " ", text)
     return text.strip()
 
+def sha256_file(path: Path) -> str:
+    """Return a streaming SHA-256 digest without loading large media into memory."""
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(block)
+    except OSError:
+        return ""
+    return digest.hexdigest()
+
+def normalize_audio_transcript_text(message: str) -> str:
+    """Normalize speech text for comparison only; never alter evidence text."""
+    text = str(message or "").casefold().replace("’", "'")
+    text = re.sub(r"[^\w\s]", " ", text, flags=re.UNICODE)
+    return re.sub(r"\s+", " ", text).strip()
+
+def audio_text_tokens(message: str) -> Set[str]:
+    """Return normalized unique tokens used by conservative overlap checks."""
+    return set(normalize_audio_transcript_text(message).split())
+
+def is_unresolved_audio_participant(value: str) -> bool:
+    """Recognize unresolved diarizer labels without treating real names as unknown."""
+    label = re.sub(r"[_\s-]+", " ", str(value or "").strip().casefold())
+    return (
+        not label
+        or label in {"unknown", "unknown sender", "unknown receiver", "unresolved"}
+        or bool(re.fullmatch(r"speaker\s*\d+", label))
+    )
+
+def audio_row_match_details(
+    duplicate_row: Dict[str, str],
+    canonical_row: Dict[str, str],
+) -> Optional[Dict[str, float]]:
+    """Return similarity details when one audio row is safely covered by another."""
+    duplicate_text = normalize_audio_transcript_text(duplicate_row.get("Message", ""))
+    canonical_text = normalize_audio_transcript_text(canonical_row.get("Message", ""))
+    if not duplicate_text or not canonical_text:
+        return None
+
+    duplicate_tokens = audio_text_tokens(duplicate_text)
+    canonical_tokens = audio_text_tokens(canonical_text)
+    minimum_tokens = min(len(duplicate_tokens), len(canonical_tokens))
+    if minimum_tokens < AUDIO_DUPLICATE_MIN_TOKENS:
+        return None
+
+    # Conflicting resolved identities are evidence against duplication. When
+    # one side is unresolved, compare the known participant set without
+    # assuming that the partial attribution assigned the correct role.
+    duplicate_people = {
+        str(duplicate_row.get(field, "")).strip().casefold()
+        for field in ("Sender", "Receiver")
+        if not is_unresolved_audio_participant(duplicate_row.get(field, ""))
+    }
+    canonical_people = {
+        str(canonical_row.get(field, "")).strip().casefold()
+        for field in ("Sender", "Receiver")
+        if not is_unresolved_audio_participant(canonical_row.get(field, ""))
+    }
+    duplicate_fully_resolved = len(duplicate_people) == 2
+    canonical_fully_resolved = len(canonical_people) == 2
+    if duplicate_fully_resolved and canonical_fully_resolved:
+        for field in ("Sender", "Receiver"):
+            if (
+                str(duplicate_row.get(field, "")).strip().casefold()
+                != str(canonical_row.get(field, "")).strip().casefold()
+            ):
+                return None
+    elif duplicate_people and not duplicate_people.issubset(canonical_people):
+        return None
+
+    sequence_ratio = SequenceMatcher(None, duplicate_text, canonical_text).ratio()
+    shared_tokens = duplicate_tokens & canonical_tokens
+    token_containment = len(shared_tokens) / max(1, minimum_tokens)
+
+    if (
+        sequence_ratio < AUDIO_DUPLICATE_ROW_SEQUENCE_THRESHOLD
+        or token_containment < AUDIO_DUPLICATE_TOKEN_CONTAINMENT_THRESHOLD
+    ):
+        return None
+    return {
+        "sequence_ratio": sequence_ratio,
+        "token_containment": token_containment,
+    }
+
+def audio_candidate_coverage(
+    duplicate: AudioCandidate,
+    canonical: AudioCandidate,
+) -> Optional[Dict[str, Any]]:
+    """Check whether every row of ``duplicate`` is represented by ``canonical``."""
+    if duplicate.sha256 and duplicate.sha256 == canonical.sha256:
+        return {
+            "method": "identical_audio_sha256",
+            "matched_rows": len(duplicate.rows),
+            "minimum_sequence_ratio": 1.0,
+            "minimum_token_containment": 1.0,
+        }
+
+    duplicate_date = str(duplicate.record.get("inferred_date", "")).strip()
+    canonical_date = str(canonical.record.get("inferred_date", "")).strip()
+    if not duplicate_date or duplicate_date != canonical_date:
+        return None
+    if not duplicate.rows or len(duplicate.rows) > len(canonical.rows):
+        return None
+
+    available = set(range(len(canonical.rows)))
+    matches: List[Dict[str, float]] = []
+    for duplicate_row in duplicate.rows:
+        best_index: Optional[int] = None
+        best_details: Optional[Dict[str, float]] = None
+        for index in available:
+            details = audio_row_match_details(duplicate_row, canonical.rows[index])
+            if details is None:
+                continue
+            if (
+                best_details is None
+                or (details["sequence_ratio"], details["token_containment"])
+                > (best_details["sequence_ratio"], best_details["token_containment"])
+            ):
+                best_index = index
+                best_details = details
+        if best_index is None or best_details is None:
+            return None
+        available.remove(best_index)
+        matches.append(best_details)
+
+    return {
+        "method": "covered_transcript_rows",
+        "matched_rows": len(matches),
+        "minimum_sequence_ratio": min(item["sequence_ratio"] for item in matches),
+        "minimum_token_containment": min(item["token_containment"] for item in matches),
+    }
+
+def audio_candidate_quality(candidate: AudioCandidate) -> Tuple[Any, ...]:
+    """Rank canonical recordings using evidence quality, never transcript meaning."""
+    rows = candidate.rows
+    unresolved_fields = sum(
+        is_unresolved_audio_participant(row.get(field, ""))
+        for row in rows
+        for field in ("Sender", "Receiver")
+    )
+    resolved_fields = (2 * len(rows)) - unresolved_fields
+    known_people = {
+        str(row.get(field, "")).strip().casefold()
+        for row in rows
+        for field in ("Sender", "Receiver")
+        if not is_unresolved_audio_participant(row.get(field, ""))
+    }
+    nonzero_offsets = sum(
+        1 for row in rows if float(row.get("_offset_seconds", "0") or 0) > 0
+    )
+    token_count = sum(len(normalize_audio_transcript_text(row.get("Message", "")).split()) for row in rows)
+    return (
+        unresolved_fields == 0,
+        resolved_fields,
+        len(known_people),
+        len(rows),
+        nonzero_offsets,
+        token_count,
+        -candidate.order,
+    )
+
+def remove_exact_rows_within_audio_candidate(candidate: AudioCandidate) -> int:
+    """Remove only byte-equivalent CSV artifacts at the same audio offset."""
+    kept: List[Dict[str, str]] = []
+    seen: Set[Tuple[str, ...]] = set()
+    for row in candidate.rows:
+        key = (
+            str(row.get("Timestamp", "")),
+            str(row.get("_offset_seconds", "")),
+            str(row.get("Sender", "")).strip().casefold(),
+            str(row.get("Receiver", "")).strip().casefold(),
+            normalize_message_for_dedupe(row.get("Message", "")),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        kept.append(row)
+    removed = len(candidate.rows) - len(kept)
+    candidate.rows = kept
+    return removed
+
+def deduplicate_audio_candidates(
+    candidates: List[AudioCandidate],
+    enabled: bool = True,
+) -> Tuple[List[Dict[str, str]], Dict[str, Any]]:
+    """Select canonical audio evidence while retaining auditable source records."""
+    summary: Dict[str, Any] = {
+        "enabled": bool(enabled),
+        "candidate_recordings": len(candidates),
+        "canonical_recordings": len(candidates),
+        "duplicate_recordings_removed": 0,
+        "exact_rows_removed": 0,
+        "thresholds": {
+            "row_sequence_ratio": AUDIO_DUPLICATE_ROW_SEQUENCE_THRESHOLD,
+            "token_containment": AUDIO_DUPLICATE_TOKEN_CONTAINMENT_THRESHOLD,
+            "minimum_unique_tokens": AUDIO_DUPLICATE_MIN_TOKENS,
+        },
+        "decisions": [],
+    }
+    if not enabled:
+        return [row for candidate in candidates for row in candidate.rows], summary
+
+    for candidate in candidates:
+        removed = remove_exact_rows_within_audio_candidate(candidate)
+        if removed:
+            candidate.record["exact_rows_removed"] = str(removed)
+            candidate.record["rows"] = str(len(candidate.rows))
+            summary["exact_rows_removed"] += removed
+
+    ranked = sorted(candidates, key=audio_candidate_quality, reverse=True)
+    canonical_candidates: List[AudioCandidate] = []
+    for candidate in ranked:
+        duplicate_of: Optional[AudioCandidate] = None
+        duplicate_details: Optional[Dict[str, Any]] = None
+        for canonical in canonical_candidates:
+            details = audio_candidate_coverage(candidate, canonical)
+            if details is not None:
+                duplicate_of = canonical
+                duplicate_details = details
+                break
+
+        if duplicate_of is None:
+            canonical_candidates.append(candidate)
+            continue
+
+        candidate.record["status"] = "duplicate"
+        candidate.record["rows_before_dedupe"] = str(len(candidate.rows))
+        candidate.record["rows"] = "0"
+        candidate.record["duplicate_of"] = str(duplicate_of.source_audio)
+        candidate.record["duplicate_method"] = str(duplicate_details["method"])
+        candidate.record["duplicate_min_sequence_ratio"] = (
+            f"{float(duplicate_details['minimum_sequence_ratio']):.6f}"
+        )
+        candidate.record["duplicate_min_token_containment"] = (
+            f"{float(duplicate_details['minimum_token_containment']):.6f}"
+        )
+        candidate.record["reason"] = (
+            "excluded from normalized CSV because its transcript is covered by "
+            f"the canonical audio source {duplicate_of.source_audio.name}"
+        )
+        summary["decisions"].append({
+            "excluded_audio": str(candidate.source_audio),
+            "canonical_audio": str(duplicate_of.source_audio),
+            **duplicate_details,
+        })
+
+    canonical_candidates.sort(key=lambda item: item.order)
+    summary["canonical_recordings"] = len(canonical_candidates)
+    summary["duplicate_recordings_removed"] = len(candidates) - len(canonical_candidates)
+    rows = [row for candidate in canonical_candidates for row in candidate.rows]
+    return rows, summary
+
 COMMON_IDENTIFIER_TLDS = (
     "com|net|org|edu|gov|mil|int|io|ai|co|uk|gr|eu|de|fr|it|es|nl|"
     "be|ch|at|us|ca|au|info|biz|online|site|app|dev|tech|me|tv"
@@ -1395,11 +1671,22 @@ def repair_broken_identifiers(message: str) -> str:
         value,
     )
 
-    # Email addresses with a split dot/TLD: ``name@example. com``.
+    # ``www`` is itself an unambiguous web cue, so OCR whitespace around its
+    # dot can be removed without touching ordinary sentence punctuation.
     value = re.sub(
-        rf"([\w.+-]+@[A-Za-z0-9.-]*[A-Za-z0-9-])\s*\.\s*"
+        r"\bwww\s*\.\s*(?=[A-Za-z0-9])",
+        "www.",
+        value,
+        flags=re.I,
+    )
+
+    # Email addresses with OCR whitespace around ``@`` or the final dot/TLD:
+    # ``name @ example. com`` -> ``name@example.com``.
+    value = re.sub(
+        rf"([\w.+-]+)\s*@\s*"
+        rf"([A-Za-z0-9][A-Za-z0-9.-]*[A-Za-z0-9-])\s*\.\s*"
         rf"({COMMON_IDENTIFIER_TLDS})\b",
-        r"\1.\2",
+        r"\1@\2.\3",
         value,
         flags=re.I,
     )
@@ -1419,10 +1706,23 @@ def repair_broken_identifiers(message: str) -> str:
         flags=re.I,
     )
 
-    # A domain may lose its only dot (``website anydeskcom``). Repair this
-    # solely after an explicit web-context cue to avoid changing ordinary words.
+    # A bare host has no scheme or ``www`` prefix. Repair a separated final
+    # dot/TLD only after an explicit web-context cue; this covers OCR such as
+    # ``website anydesk. com`` without treating normal prose as a domain.
+    web_context_cue = r"((?:website|web\s+site|site|url|visit|go\s+to)\s+)"
+    bare_host = r"([A-Za-z0-9][A-Za-z0-9.-]*[A-Za-z0-9-])"
     value = re.sub(
-        rf"\b((?:website|web\s+site|site|url|visit|go\s+to)\s+)"
+        rf"\b{web_context_cue}{bare_host}\s*\.\s*"
+        rf"({COMMON_IDENTIFIER_TLDS})\b",
+        r"\1\2.\3",
+        value,
+        flags=re.I,
+    )
+
+    # A domain may instead lose its only dot (``website anydeskcom``).
+    # Keep the same explicit-context restriction to avoid changing words.
+    value = re.sub(
+        rf"\b{web_context_cue}"
         rf"([A-Za-z0-9-]{{2,}}?)({COMMON_IDENTIFIER_TLDS})\b",
         r"\1\2.\3",
         value,
@@ -1430,15 +1730,39 @@ def repair_broken_identifiers(message: str) -> str:
     )
     return value
 
+
+def repair_chat_message_identifiers(rows: Sequence[Dict[str, str]]) -> int:
+    """Apply low-risk URL/email repair deterministically to chat rows.
+
+    This pass deliberately runs outside the LLM. It changes only ``Message``
+    and only when ``repair_broken_identifiers`` recognizes an unmistakable
+    URL, website, domain, or email pattern. The returned count is the number
+    of chat rows whose message changed.
+    """
+    repaired = 0
+    for row in rows:
+        if row.get("_source_kind") != "chat":
+            continue
+        original = str(row.get("Message", ""))
+        corrected = repair_broken_identifiers(original)
+        if corrected != original:
+            row["Message"] = corrected
+            repaired += 1
+    return repaired
+
 def conservative_final_message_cleanup(message: str) -> str:
     """Final low-risk OCR cleanup for merged transcript rows."""
-    msg = repair_broken_identifiers(str(message or "").strip())
+    msg = str(message or "").strip()
     msg = msg.replace("“", '"').replace("”", '"').replace("‘", "'").replace("’", "'")
 
     msg = re.sub(r"\s+", " ", msg).strip()
     msg = re.sub(r"\s+([,.;:!?])", r"\1", msg)
     msg = re.sub(r"([,.;:!?])(?=[A-Za-z])", r"\1 ", msg)
-    return msg
+
+    # Run identifier repair last. The generic punctuation rule above inserts
+    # sentence spacing after a period; if identifier repair ran first, that
+    # rule would turn ``example.com`` back into ``example. com``.
+    return repair_broken_identifiers(msg)
 
 def split_final_chat_row(row: Dict[str, str]) -> List[Dict[str, str]]:
     """Apply final message cleanup without dataset-specific row splitting."""
@@ -1824,6 +2148,7 @@ def write_run_manifest(
     failure_reasons: Optional[Sequence[str]] = None,
     raw_chat_output: Optional[Path] = None,
     polished_chat_output: Optional[Path] = None,
+    audio_deduplication: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Writes a JSON manifest describing extraction inputs/results."""
     unique_failures = list(dict.fromkeys(failure_reasons or []))
@@ -1838,6 +2163,7 @@ def write_run_manifest(
         "polished_chat_output": str(polished_chat_output) if polished_chat_output else None,
         "rows_merged": rows_merged,
         "chat_polish": polish_result,
+        "audio_deduplication": audio_deduplication,
         "settings": {
             "model": args.model,
             "langs": args.langs,
@@ -1853,8 +2179,10 @@ def write_run_manifest(
             "audio_dtype": args.audio_dtype,
             "audio_llm_backend": args.audio_llm_backend,
             "audio_ollama_model": args.audio_ollama_model or args.model,
+            "audio_deduplication_enabled": not args.keep_duplicates,
             "chat_polish_enabled": not args.no_chat_polish,
             "chat_polish_model": args.chat_polish_model or args.model,
+            "chat_csvs_retained": should_keep_chat_csvs(args),
         },
         "evidence_sources": [
             {
@@ -1873,7 +2201,11 @@ def write_run_manifest(
             "skipped_images": sum(1 for item in image_records if item.get("status", "").startswith("skipped")),
             "failed_images": sum(1 for item in image_records if item.get("status") == "failed"),
             "processed_audio": sum(1 for item in audio_records if item.get("status") == "ok"),
-            "failed_audio": sum(1 for item in audio_records if item.get("status") == "failed"),
+            "duplicate_audio": sum(1 for item in audio_records if item.get("status") == "duplicate"),
+            "failed_audio": sum(
+                1 for item in audio_records
+                if item.get("status") not in {"ok", "duplicate"}
+            ),
         },
         "images": image_records,
         "audio": audio_records,
@@ -1988,14 +2320,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="Disable the post-extraction Message-only LLM pass.",
     )
     polish_group.add_argument(
+        "--keep-chat-csvs",
+        action="store_true",
+        help=(
+            "Keep <stem>_chat_raw.csv and <stem>_chat_polished.csv. "
+            "Default: off; only the final merged CSV is retained."
+        ),
+    )
+    polish_group.add_argument(
         "--raw-chat-output",
         default=None,
-        help="Raw chat-only CSV path. Default: results/<stem>_chat_raw.csv.",
+        help=(
+            "Custom raw chat-only CSV path. Supplying this option enables "
+            "chat-CSV retention even without --keep-chat-csvs."
+        ),
     )
     polish_group.add_argument(
         "--polished-chat-output",
         default=None,
-        help="Polished chat-only CSV path. Default: results/<stem>_chat_polished.csv.",
+        help=(
+            "Custom polished chat-only CSV path. Supplying this option enables "
+            "chat-CSV retention even without --keep-chat-csvs."
+        ),
     )
     parser.add_argument(
         "--langs",
@@ -2036,7 +2382,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dump-ocr", action="store_true", help="Pass --dump-ocr to extractors and keep debug output.")
     parser.add_argument("--dump-draft", action="store_true", help="Pass --dump-draft to extractors and keep debug output.")
     parser.add_argument("--dump-side-map", action="store_true", help="Pass --dump-side-map to extractors and keep debug output.")
-    parser.add_argument("--keep-duplicates", action="store_true", help="Do not remove exact duplicate final rows while merging.")
+    parser.add_argument(
+        "--keep-duplicates",
+        action="store_true",
+        help=(
+            "Disable final chat-row deduplication and audio-recording deduplication. "
+            "Default: remove conservative, auditable duplicates."
+        ),
+    )
     parser.add_argument(
         "--manifest",
         default=None,
@@ -2171,6 +2524,7 @@ def main() -> int:
         results_dir,
         f"{input_plan.run_stem}_merged.csv",
     )
+    keep_chat_csvs = should_keep_chat_csvs(args)
     raw_chat_path = resolve_output_path(
         args.raw_chat_output,
         results_dir,
@@ -2262,8 +2616,11 @@ def main() -> int:
     print(f"-> Per-image outputs: {per_image_label}")
     print(f"-> Per-audio outputs: {audio_output_label}")
     print(f"-> Output CSV: {output_path}")
-    print(f"-> Raw chat-only CSV: {raw_chat_path}")
-    print(f"-> Polished chat-only CSV: {polished_chat_path}")
+    if keep_chat_csvs:
+        print(f"-> Raw chat-only CSV: {raw_chat_path}")
+        print(f"-> Polished chat-only CSV: {polished_chat_path}")
+    else:
+        print("-> Chat-only CSV retention: disabled (use --keep-chat-csvs to enable)")
     print(f"-> Manifest: {manifest_path or 'disabled'}")
     print(f"-> Classify mode: {args.classify_mode}")
     print(f"-> Force platform: {args.force_platform}")
@@ -2277,6 +2634,15 @@ def main() -> int:
     all_rows: List[Dict[str, str]] = []
     image_records: List[Dict[str, str]] = []
     audio_records: List[Dict[str, str]] = []
+    audio_candidates: List[AudioCandidate] = []
+    audio_dedupe_summary: Dict[str, Any] = {
+        "enabled": not args.keep_duplicates,
+        "candidate_recordings": 0,
+        "canonical_recordings": 0,
+        "duplicate_recordings_removed": 0,
+        "exact_rows_removed": 0,
+        "decisions": [],
+    }
     deferred_emails: List[Tuple[Path, Path, Path, Dict[str, str]]] = []
     failure_reasons: List[str] = []
     audio_returncode = 0
@@ -2396,17 +2762,18 @@ def main() -> int:
         image_records.append(record)
 
     # ------------------------------------------------------------
-    # STRICT ORDER: completed chats -> raw chat CSV -> Message-only
-    # LLM polish -> polished chat CSV -> audio -> email.
+    # STRICT ORDER: completed chats -> optional raw chat checkpoint ->
+    # Message-only LLM polish -> optional polished checkpoint -> audio -> email.
     # ------------------------------------------------------------
     chat_rows = [row for row in all_rows if row.get("_source_kind") == "chat"]
     if chat_rows:
-        raw_count = write_merged_csv(
-            rows=[dict(row) for row in chat_rows],
-            output_path=raw_chat_path,
-            dedupe=not args.keep_duplicates,
-        )
-        print(f"\n[INFO] Raw chat-only CSV written: {raw_chat_path} ({raw_count} rows)")
+        if keep_chat_csvs:
+            raw_count = write_merged_csv(
+                rows=[dict(row) for row in chat_rows],
+                output_path=raw_chat_path,
+                dedupe=not args.keep_duplicates,
+            )
+            print(f"\n[INFO] Raw chat-only CSV written: {raw_chat_path} ({raw_count} rows)")
 
         if not args.no_chat_polish:
             polish_host = args.chat_polish_host or os.environ.get(
@@ -2432,6 +2799,12 @@ def main() -> int:
                 f"rejected={polish_result.get('rejected', 0)}"
             )
 
+        repaired_identifiers = repair_chat_message_identifiers(chat_rows)
+        print(
+            "[INFO] Deterministic chat identifier repair: "
+            f"repaired_rows={repaired_identifiers}"
+        )
+
         repaired_participants, unresolved_labels = repair_invalid_chat_participants(
             chat_rows, input_plan.report_path,
         )
@@ -2447,15 +2820,16 @@ def main() -> int:
             failure_reasons.append(reason)
             print(f"[ERROR] {reason}", file=sys.stderr)
 
-        polished_count = write_merged_csv(
-            rows=[dict(row) for row in chat_rows],
-            output_path=polished_chat_path,
-            dedupe=not args.keep_duplicates,
-        )
-        print(
-            f"[INFO] Polished chat-only CSV written: {polished_chat_path} "
-            f"({polished_count} rows)"
-        )
+        if keep_chat_csvs:
+            polished_count = write_merged_csv(
+                rows=[dict(row) for row in chat_rows],
+                output_path=polished_chat_path,
+                dedupe=not args.keep_duplicates,
+            )
+            print(
+                f"[INFO] Polished chat-only CSV written: {polished_chat_path} "
+                f"({polished_count} rows)"
+            )
 
     if input_plan.audio_files:
         csv_paths, audio_records, audio_returncode = run_audio_diarizer(
@@ -2475,7 +2849,9 @@ def main() -> int:
             resolve_audio_base_date([], input_plan.report_path, explicit_date=args.audio_date)
             if args.audio_date else None
         )
-        for csv_path, record in zip(csv_paths, successful_audio_records):
+        for audio_order, (csv_path, record) in enumerate(
+            zip(csv_paths, successful_audio_records)
+        ):
             source_audio = Path(record["audio"])
             undated_rows = read_audio_csv(
                 csv_path,
@@ -2536,14 +2912,37 @@ def main() -> int:
             )
             print(f"-> Audio rows read from {source_audio.name}: {len(rows)}")
             if rows:
-                all_rows.extend(rows)
                 record["rows"] = str(len(rows))
+                audio_hash = sha256_file(source_audio)
+                record["sha256"] = audio_hash
+                audio_candidates.append(AudioCandidate(
+                    rows=rows,
+                    record=record,
+                    source_audio=source_audio,
+                    source_csv=csv_path,
+                    order=audio_order,
+                    sha256=audio_hash,
+                ))
             else:
                 record["status"] = "empty"
                 record["reason"] = "audio CSV contained no mergeable dated rows"
 
+        selected_audio_rows, audio_dedupe_summary = deduplicate_audio_candidates(
+            audio_candidates,
+            enabled=not args.keep_duplicates,
+        )
+        all_rows.extend(selected_audio_rows)
+        print(
+            "[INFO] Audio deduplication: "
+            f"candidates={audio_dedupe_summary['candidate_recordings']} "
+            f"canonical={audio_dedupe_summary['canonical_recordings']} "
+            f"recordings_removed={audio_dedupe_summary['duplicate_recordings_removed']} "
+            f"exact_rows_removed={audio_dedupe_summary['exact_rows_removed']}"
+        )
+
         failed_audio_count = sum(
-            1 for record in audio_records if record.get("status") != "ok"
+            1 for record in audio_records
+            if record.get("status") not in {"ok", "duplicate"}
         )
         if audio_returncode != 0 or failed_audio_count:
             reason = (
@@ -2613,8 +3012,9 @@ def main() -> int:
                 args,
                 polish_result=polish_result,
                 failure_reasons=failure_reasons or ["no rows extracted"],
-                raw_chat_output=raw_chat_path if chat_rows else None,
-                polished_chat_output=polished_chat_path if chat_rows else None,
+                raw_chat_output=raw_chat_path if chat_rows and keep_chat_csvs else None,
+                polished_chat_output=polished_chat_path if chat_rows and keep_chat_csvs else None,
+                audio_deduplication=audio_dedupe_summary,
             )
             print(f"[INFO] Manifest saved to: {manifest_path}")
         if temporary_per_image_workspace is not None:
@@ -2644,8 +3044,9 @@ def main() -> int:
             args,
             polish_result=polish_result,
             failure_reasons=failure_reasons,
-            raw_chat_output=raw_chat_path if chat_rows else None,
-            polished_chat_output=polished_chat_path if chat_rows else None,
+            raw_chat_output=raw_chat_path if chat_rows and keep_chat_csvs else None,
+            polished_chat_output=polished_chat_path if chat_rows and keep_chat_csvs else None,
+            audio_deduplication=audio_dedupe_summary,
         )
 
     print("\n[PARTIAL FAILURE]" if partial_failure else "\n[SUCCESS]")
@@ -2666,6 +3067,9 @@ def main() -> int:
         print(f"Per-audio files saved under: {audio_output_dir}")
     elif input_plan.audio_files:
         print("Per-audio files were temporary and have been removed.")
+    if chat_rows and keep_chat_csvs:
+        print(f"Raw chat-only CSV saved to: {raw_chat_path}")
+        print(f"Polished chat-only CSV saved to: {polished_chat_path}")
     for source in input_plan.evidence_sources:
         if source.extracted:
             print(f"Extracted ZIP saved under: {source.root_path}")

@@ -14,6 +14,7 @@ import csv
 import json
 import re
 import sys
+import tempfile
 import unicodedata
 from datetime import datetime
 from difflib import SequenceMatcher
@@ -530,35 +531,39 @@ Return ONLY one JSON object using this exact schema:
   "salutation": "opening salutation only, if present",
   "subject": "visible subject",
   "layout_type": "plain_text, designed_html, or unknown",
+  "main_message_bbox": [left, top, right, bottom],
+  "body_complete": true,
   "signature_contact": "email/phone/web address visibly located inside the signature block, not in the From header",
   "content_blocks": [
     {
       "order": 1,
       "kind": "body, closing, signature, contact, callout, table, footer, button, or other",
       "flow": "primary or separate",
+      "region": "main_message, ancillary_sidebar, email_header, or application_ui",
       "text": "visible text for this block"
     }
-  ],
-  "full_body_text": "all visible email-message text after the salutation, in reading order",
-  "primary_body": "continuous primary-flow message text, excluding the salutation"
+  ]
 }
 
 Rules:
 1. Extract only the open email. Exclude navigation, toolbar/status text, buttons, reply controls, inbox counts, labels, and unrelated UI.
 2. Put the opening greeting only in salutation. Do not silently discard it.
-3. content_blocks must follow visual reading order. Each visually distinct region is a separate block.
-4. flow="primary" means the block belongs to the continuous message column/paragraph flow. flow="separate" means a visually detached card, panel, table, badge, button, support box, or footer.
-5. For a plain-text email, body paragraphs, closing, signature and signature contact normally have flow="primary".
-6. For a designed/HTML email, introductory prose in the main article area has flow="primary". Visually separate action/payment/parcel/support panels, cards, tables, buttons and automated notices have flow="separate", even when they contain readable text.
-7. full_body_text is an exact transcription of all visible email-message content after the salutation, in natural reading order. It may include detached panels because it is a transcription field, not a selection decision.
-8. primary_body is only the continuous primary-flow message, excluding the salutation. For designed HTML mail, stop before the first detached panel/card. For plain text, include inline payment/bank details, closing and signature.
-9. signature_contact must be populated only when the contact is visibly part of the signature/body. Do not copy the From-header address into this field merely because it is visible in the header.
-10. Do not include subject or From/To headers in content_blocks, full_body_text, or primary_body.
-11. Preserve visible wording exactly. Do not correct, summarize, complete, paraphrase, or invent text. Do not omit the first words of a sentence.
-12. sender_brand is the full human-readable parent organization, not a logo acronym alone and not merely a department suffix.
-13. If the screenshot is not an email, set is_email=false and leave remaining strings/lists empty.
-14. Identity fields may contain only a visible person name, organization name, email address, or the literal UI value 'me'. Never put a document heading, section title, offence label, role, or sentence in an identity field.
-15. Treat an email address or website as one indivisible identifier. Join line-wrap/OCR spaces inside it; never split around '.', '/', ':', '@', or the top-level domain.
+3. main_message_bbox is [left, top, right, bottom] on a 0..1000 normalized image. It must cover the complete message from the salutation through the last signature/disclaimer, including embedded callouts, payment panels and tables, but exclude From/To headers, subject, app UI and sidebars that are not part of the message.
+4. content_blocks must follow visual reading order. Each visually distinct region is a separate block.
+5. region="main_message" includes every block that forms the authored email: paragraphs, inline or embedded callouts, payment/account panels, tables, closing, signature and disclaimers. A visually boxed block can still be main_message.
+6. region="ancillary_sidebar" is only for a parallel side column that is not part of the authored reading flow. region="email_header" is for subject/From/To/date metadata. region="application_ui" is for the mail application's controls or navigation.
+7. flow describes visual continuity, not relevance. A detached callout inside the main message has flow="separate" and region="main_message".
+8. For a plain-text email, body paragraphs, closing, signature and signature contact normally have flow="primary" and region="main_message".
+9. body_complete is true only if content_blocks reach the visibly final authored line inside main_message_bbox. A colon introducing missing details, a cut-off sentence, or omitted lower content means false.
+10. signature_contact must be populated only when the contact is visibly part of the signature/body. Do not copy the From-header address into this field merely because it is visible in the header.
+11. Do not include subject or From/To headers in content_blocks.
+12. Preserve visible wording exactly. Do not correct, summarize, complete, paraphrase, or invent text. Do not omit the first words of a sentence.
+13. sender_brand is the full human-readable parent organization, not a logo acronym alone and not merely a department suffix.
+14. If the screenshot is not an email, set is_email=false and leave remaining strings/lists empty.
+15. Identity fields may contain only a visible person name, organization name, email address, or the literal UI value 'me'. Never put a document heading, section title, offence label, role, or sentence in an identity field.
+16. Treat an email address, website, handle, IBAN, amount and currency as verbatim evidence. Preserve symbols and join only line-wrap/OCR spaces that visibly belong inside one identifier.
+17. Normalize OCR/line-wrap whitespace inside a URL or website domain only: remove spaces after a scheme, after "www.", and on either side of domain dots. For example, transcribe "www. example. com" as "www.example.com". Do not otherwise rewrite the identifier.
+18. Do not transcribe decorative icons, logo glyphs, panel borders or visual column separators as characters. A boxed logo letter beside a label is not part of the label, and a visual divider is not a literal "|".
 """.strip()
 
 
@@ -572,12 +577,824 @@ def extract_draft_with_vision(image_path: Path, model: str) -> Dict[str, Any]:
                 "images": [str(image_path)],
             }
         ],
-        num_predict=2048,
+        num_predict=3072,
     )
     data = extract_json_object(text)
     if not data:
         raise RuntimeError("Vision model did not return a valid JSON object.")
     return data
+
+
+def _normalized_message_bbox(value: Any) -> Tuple[float, float, float, float] | None:
+    """Validate a model-supplied main-message box and normalize it to 0..1."""
+    if not isinstance(value, (list, tuple)) or len(value) != 4:
+        return None
+    try:
+        left, top, right, bottom = (float(item) for item in value)
+    except (TypeError, ValueError):
+        return None
+
+    scale = 1000.0 if max(abs(left), abs(top), abs(right), abs(bottom)) > 1.5 else 1.0
+    left, top, right, bottom = (item / scale for item in (left, top, right, bottom))
+    left, top = max(0.0, left), max(0.0, top)
+    right, bottom = min(1.0, right), min(1.0, bottom)
+    if right - left < 0.18 or bottom - top < 0.12:
+        return None
+    return left, top, right, bottom
+
+
+def _temporary_main_body_crop(
+    image_path: Path,
+    draft: Dict[str, Any],
+    *,
+    upscale: float = 1.0,
+    enhance_contrast: bool = False,
+) -> Tuple[Path, bool]:
+    """Create a padded crop when a reliable normalized body box is available."""
+    bbox = _normalized_message_bbox(draft.get("main_message_bbox"))
+    if bbox is None and upscale <= 1.0 and not enhance_contrast:
+        return image_path, False
+
+    try:
+        from PIL import Image, ImageOps
+
+        with Image.open(image_path) as image:
+            width, height = image.size
+            if bbox is not None:
+                left, top, right, bottom = bbox
+                # A first pass that misses the final paragraphs may also report
+                # a prematurely short box. Keep its horizontal column selection
+                # but expose the lower screen to the body-only verifier.
+                bottom = max(bottom, 0.965)
+                pad_x = 0.012
+                pad_y = 0.012
+                pixel_box = (
+                    max(0, round((left - pad_x) * width)),
+                    max(0, round((top - pad_y) * height)),
+                    min(width, round((right + pad_x) * width)),
+                    min(height, round((bottom + pad_y) * height)),
+                )
+                cropped = image.crop(pixel_box).convert("RGB")
+            else:
+                cropped = image.convert("RGB")
+            if enhance_contrast:
+                cropped = ImageOps.autocontrast(cropped)
+            if upscale > 1.0:
+                cropped = cropped.resize(
+                    (
+                        max(1, round(cropped.width * upscale)),
+                        max(1, round(cropped.height * upscale)),
+                    ),
+                    Image.Resampling.LANCZOS,
+                )
+            temporary = tempfile.NamedTemporaryFile(
+                prefix="email_main_body_", suffix=".png", delete=False,
+            )
+            temporary.close()
+            cropped.save(temporary.name, format="PNG")
+            return Path(temporary.name), True
+    except Exception:
+        # A missing Pillow installation or malformed box must not disable the
+        # vision pipeline; the body-only prompt can still use the full image.
+        return image_path, False
+
+
+def transcribe_main_body_with_vision(
+    image_path: Path,
+    model: str,
+    draft: Dict[str, Any],
+    *,
+    current_body: str = "",
+    retry_reasons: Sequence[str] = (),
+) -> Dict[str, Any]:
+    """Transcribe the authored message from a focused crop without rewriting it."""
+    vision_path, must_remove = _temporary_main_body_crop(image_path, draft)
+    retry_note = ""
+    if current_body:
+        retry_note = f"""
+The earlier transcription may be incomplete for these generic reasons:
+{json.dumps(list(retry_reasons), ensure_ascii=False)}
+Use it only as a coverage checklist. Re-read the image and do not copy or complete
+anything that is not visibly supported.
+
+EARLIER TRANSCRIPTION:
+---
+{normalize_space(current_body)[:5000]}
+---
+""".strip()
+
+    prompt = f"""
+Transcribe the complete authored body of the open email in this image.
+Return ONLY JSON with this schema:
+{{
+  "salutation": "opening greeting only",
+  "body_complete": true,
+  "start_anchor": "first 8-15 visible words after the salutation",
+  "end_anchor": "last 8-15 visible words of the authored message",
+  "content_blocks": [
+    {{
+      "order": 1,
+      "kind": "body, closing, signature, contact, callout, table, footer, button, or other",
+      "region": "main_message",
+      "flow": "primary or separate",
+      "text": "exact visible text"
+    }}
+  ]
+}}
+
+Rules:
+- Read the main authored message from top to bottom.
+- Include all body paragraphs, embedded warnings/callouts, payment or account
+  panels, tables, beneficiary details, closing, signature, signature contact and
+  authored disclaimer that belong to that message.
+- Exclude subject, From/To/date headers, navigation, toolbars, reply controls and
+  any parallel ancillary sidebar outside the authored reading flow.
+- A boxed or detached panel inside the main message is still main_message.
+- Put the greeting only in salutation and exclude it from content_blocks.
+- Preserve exact visible wording, capitalization, punctuation, currency symbols,
+  amounts, email addresses, URLs, handles, account numbers and IBANs.
+- Normalize only false OCR/line-wrap spaces inside website identifiers: remove
+  spaces after a URL scheme or "www." and around domain dots. Thus
+  "www. example. com" must be returned as "www.example.com".
+- Re-read short grammatical words and field labels exactly as shown; do not
+  replace labels with synonyms or silently change articles/capitalization.
+- Do not emit decorative icons, logo glyphs, table borders or visual separators
+  as text. A logo letter next to a field label and a panel divider are not part
+  of the authored wording.
+- Never summarize, paraphrase, autocorrect, infer or invent obscured/missing text.
+- body_complete is true only if the transcription reaches the visibly final
+  authored line. A colon introducing omitted details or a cut-off sentence is
+  incomplete.
+
+{retry_note}
+""".strip()
+    try:
+        return extract_json_object(
+            ollama_chat(
+                model,
+                [{"role": "user", "content": prompt, "images": [str(vision_path)]}],
+                num_predict=4096,
+            )
+        )
+    finally:
+        if must_remove:
+            try:
+                vision_path.unlink()
+            except OSError:
+                pass
+
+
+def _block_transcript(value: Dict[str, Any]) -> str:
+    return _compose_block_message(value, _effective_layout(value))
+
+
+def _ordered_token_coverage(source: str, candidate: str) -> float:
+    """Return how much of source survives in candidate in the same order."""
+    source_tokens = re.findall(r"\w+", _fold_identity_text(source))
+    candidate_tokens = re.findall(r"\w+", _fold_identity_text(candidate))
+    if not source_tokens or not candidate_tokens:
+        return 0.0
+    matcher = SequenceMatcher(None, source_tokens, candidate_tokens, autojunk=False)
+    matched = sum(block.size for block in matcher.get_matching_blocks())
+    return matched / len(source_tokens)
+
+
+def merge_body_refinement(
+    draft: Dict[str, Any],
+    refined: Dict[str, Any],
+) -> Tuple[Dict[str, Any], bool]:
+    """Accept a screenshot-grounded body pass while retaining first-pass metadata."""
+    if not isinstance(refined, dict):
+        return draft, False
+    blocks = refined.get("content_blocks")
+    if not isinstance(blocks, list):
+        return draft, False
+
+    cleaned_blocks: List[Dict[str, Any]] = []
+    for index, block in enumerate(blocks, start=1):
+        if not isinstance(block, dict) or not normalize_space(block.get("text")):
+            continue
+        cleaned = dict(block)
+        cleaned["order"] = index
+        cleaned["region"] = "main_message"
+        flow = normalize_space(cleaned.get("flow")).lower()
+        cleaned["flow"] = flow if flow in {"primary", "separate"} else "primary"
+        cleaned_blocks.append(cleaned)
+    if not cleaned_blocks:
+        return draft, False
+
+    candidate_draft = dict(draft)
+    candidate_draft["content_blocks"] = cleaned_blocks
+    candidate = _block_transcript(candidate_draft)
+    current, _, _ = _select_message_body(draft)
+    if len(normalize_space(candidate)) < 30:
+        return draft, False
+    if current and _ordered_token_coverage(current, candidate) < 0.34:
+        return draft, False
+    if (
+        current
+        and "_body_refinement" in draft
+        and len(normalize_space(candidate)) < 0.95 * len(normalize_space(current))
+    ):
+        return draft, False
+
+    merged = dict(draft)
+    merged["content_blocks"] = cleaned_blocks
+    # Prevent an older redundant field from winning after the canonical block
+    # transcription has been accepted.
+    merged["full_body_text"] = ""
+    merged["primary_body"] = ""
+    merged["body_complete"] = bool(refined.get("body_complete", False))
+    refined_salutation = normalize_space(refined.get("salutation"))
+    if refined_salutation:
+        merged["salutation"] = refined_salutation
+    merged["_body_refinement"] = refined
+    return merged, True
+
+
+def body_incompleteness_reasons(draft: Dict[str, Any], body: str) -> List[str]:
+    """Find generic truncation signals; these trigger re-reading, never completion."""
+    value = normalize_space(body)
+    reasons: List[str] = []
+    if draft.get("body_complete") is False:
+        reasons.append("vision pass marked the body incomplete")
+    if len(value) < 40 and draft.get("body_complete") is not True:
+        reasons.append("body is unusually short")
+    if _opening_needs_repair(value):
+        reasons.append("body begins with a likely continuation word")
+    if re.search(r"(?:[:,;]|\b(?:and|or|the|to|for|with))\s*$", value, flags=re.I):
+        reasons.append("body ends with an unfinished introducer or connector")
+    return reasons
+
+
+def verify_critical_evidence_with_vision(
+    image_path: Path,
+    model: str,
+    draft: Dict[str, Any],
+    body: str,
+) -> Dict[str, Any]:
+    """Re-read high-risk evidence tokens separately from prose transcription."""
+    del body  # Do not anchor the verifier to a possibly incorrect transcription.
+    vision_path, must_remove = _temporary_main_body_crop(
+        image_path,
+        draft,
+        upscale=2.0,
+        enhance_contrast=True,
+    )
+    prompt = f"""
+Inspect only the authored main email body and return its visible critical evidence.
+Return ONLY JSON:
+{{
+  "amounts": [{{"verbatim": "exact amount including currency"}}],
+  "email_addresses": ["exact visible address"],
+  "urls": ["exact visible URL"],
+  "handles": ["exact visible @handle"],
+  "account_identifiers": ["exact visible IBAN/account/reference"]
+}}
+
+Rules:
+- Copy only tokens clearly visible in the main authored message.
+- Preserve currency symbols, separators, punctuation, case and spacing that is
+  intrinsic to the identifier.
+- Remove false OCR/line-wrap whitespace after a URL scheme or "www." and around
+  domain dots; return every website as one uninterrupted identifier.
+- Exclude values that appear only in app headers or ancillary sidebars.
+- Do not infer a missing currency, digit, domain, handle or account value.
+- Perform an independent visual read. No previous OCR/transcription value is
+  supplied because it could bias the amount or identifier you see.
+""".strip()
+    try:
+        return extract_json_object(
+            ollama_chat(
+                model,
+                [{"role": "user", "content": prompt, "images": [str(vision_path)]}],
+                num_predict=700,
+            )
+        )
+    finally:
+        if must_remove:
+            try:
+                vision_path.unlink()
+            except OSError:
+                pass
+
+
+def verify_amounts_with_second_vision_pass(
+    image_path: Path,
+    model: str,
+    draft: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Independently re-read amounts at higher scale for consensus checking."""
+    vision_path, must_remove = _temporary_main_body_crop(
+        image_path,
+        draft,
+        upscale=3.0,
+        enhance_contrast=True,
+    )
+    prompt = """
+Independently inspect the authored main email body and transcribe every visible
+monetary amount. Return ONLY JSON:
+{"amounts": [{"verbatim": "exact amount including its currency"}]}
+
+Rules:
+- Read directly from the image without guessing from context.
+- Preserve the exact currency symbol or currency code, every digit, and visible
+  thousands/decimal separators.
+- Exclude amounts located only in mail-app headers or ancillary sidebars.
+- If no monetary amount is clearly visible, return {"amounts": []}.
+""".strip()
+    try:
+        return extract_json_object(
+            ollama_chat(
+                model,
+                [{"role": "user", "content": prompt, "images": [str(vision_path)]}],
+                num_predict=240,
+            )
+        )
+    finally:
+        if must_remove:
+            try:
+                vision_path.unlink()
+            except OSError:
+                pass
+
+
+def _amount_numeric_key(value: str) -> str:
+    return "".join(re.findall(r"\d", value))
+
+
+def _verbatim_amounts(result: Dict[str, Any]) -> List[str]:
+    amounts = result.get("amounts") if isinstance(result, dict) else None
+    if not isinstance(amounts, list):
+        return []
+    values: List[str] = []
+    for item in amounts:
+        value = normalize_space(item.get("verbatim") if isinstance(item, dict) else item)
+        if value:
+            values.append(value)
+    return values
+
+
+def _normalized_currency_amount(value: str) -> str:
+    match = re.search(r"(?P<currency>[€£$])\s*(?P<number>\d[\d., ]*\d|\d)", value)
+    if not match:
+        return ""
+    return match.group("currency") + _amount_numeric_key(match.group("number"))
+
+
+def _has_currency_amount(body: str) -> bool:
+    return bool(re.search(r"[€£$]\s*\d", str(body or "")))
+
+
+def _extract_symbolic_amounts(value: Any) -> List[str]:
+    """Return symbolic monetary amounts without guessing missing characters."""
+    text = normalize_space(value)
+    pattern = re.compile(r"[€£$]\s*\d(?:[\d., ]*\d)?")
+    return [normalize_space(match.group(0)) for match in pattern.finditer(text)]
+
+
+def _easyocr_box_rect(box: Any) -> Tuple[float, float, float, float] | None:
+    """Convert an EasyOCR quadrilateral into an axis-aligned pixel box."""
+    try:
+        xs = [float(point[0]) for point in box]
+        ys = [float(point[1]) for point in box]
+    except (TypeError, ValueError, IndexError):
+        return None
+    if not xs or not ys:
+        return None
+    left, top, right, bottom = min(xs), min(ys), max(xs), max(ys)
+    if right <= left or bottom <= top:
+        return None
+    return left, top, right, bottom
+
+
+def _amount_region_candidates_from_ocr(
+    items: Sequence[Any],
+    *,
+    image_size: Tuple[int, int],
+    draft: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Locate likely amount regions from OCR boxes, independent of their value.
+
+    Direct symbolic-amount boxes are preferred. Nearby OCR boxes on the same
+    visual line are also combined so a separately detected currency glyph and
+    number can still form one candidate. The model-provided main-message box is
+    used only as a spatial filter, never as a source of text.
+    """
+    width, height = image_size
+    normalized_body = _normalized_message_bbox(draft.get("main_message_bbox"))
+    body_rect: Tuple[float, float, float, float] | None = None
+    if normalized_body is not None:
+        left, top, right, bottom = normalized_body
+        body_rect = (left * width, top * height, right * width, max(bottom, 0.965) * height)
+
+    entries: List[Dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, (list, tuple)) or len(item) < 3:
+            continue
+        rect = _easyocr_box_rect(item[0])
+        if rect is None:
+            continue
+        text = normalize_space(item[1])
+        try:
+            confidence = float(item[2])
+        except (TypeError, ValueError):
+            confidence = 0.0
+        if not text or confidence < 0.10:
+            continue
+        left, top, right, bottom = rect
+        center_x = (left + right) / 2.0
+        center_y = (top + bottom) / 2.0
+        if body_rect is not None:
+            body_left, body_top, body_right, body_bottom = body_rect
+            if not (body_left <= center_x <= body_right and body_top <= center_y <= body_bottom):
+                continue
+        entries.append({
+            "text": text,
+            "confidence": confidence,
+            "rect": rect,
+            "center_y": center_y,
+            "height": bottom - top,
+        })
+
+    candidates: List[Dict[str, Any]] = []
+    for entry in entries:
+        amounts = _extract_symbolic_amounts(entry["text"])
+        if amounts:
+            candidates.append({
+                "text": entry["text"],
+                "amounts": amounts,
+                "confidence": entry["confidence"],
+                "rect": entry["rect"],
+                "direct": True,
+            })
+
+    # Group vertically aligned OCR boxes, then split distant columns. This
+    # recovers cases where the currency symbol and digits are separate boxes.
+    lines: List[List[Dict[str, Any]]] = []
+    for entry in sorted(entries, key=lambda item: (item["center_y"], item["rect"][0])):
+        target: List[Dict[str, Any]] | None = None
+        for line in lines:
+            line_center = sum(item["center_y"] for item in line) / len(line)
+            line_height = max(item["height"] for item in line)
+            if abs(entry["center_y"] - line_center) <= 0.65 * max(entry["height"], line_height):
+                target = line
+                break
+        if target is None:
+            target = []
+            lines.append(target)
+        target.append(entry)
+
+    for line in lines:
+        ordered = sorted(line, key=lambda item: item["rect"][0])
+        segments: List[List[Dict[str, Any]]] = []
+        for entry in ordered:
+            if not segments:
+                segments.append([entry])
+                continue
+            previous = segments[-1][-1]
+            gap = entry["rect"][0] - previous["rect"][2]
+            typical_height = max(entry["height"], previous["height"])
+            if gap > max(80.0, 6.0 * typical_height):
+                segments.append([entry])
+            else:
+                segments[-1].append(entry)
+
+        for segment in segments:
+            text = normalize_space(" ".join(item["text"] for item in segment))
+            amounts = _extract_symbolic_amounts(text)
+            amount_context = bool(re.search(
+                r"(?i)\b(?:amount|total|fee|cost|price|payment|pay|transfer)\b",
+                text,
+            ))
+            formatted_number = bool(re.search(r"\b\d{1,3}(?:[,.]\d{3})+(?:[,.]\d+)?\b", text))
+            if not amounts and not (amount_context and formatted_number):
+                continue
+            left = min(item["rect"][0] for item in segment)
+            top = min(item["rect"][1] for item in segment)
+            right = max(item["rect"][2] for item in segment)
+            bottom = max(item["rect"][3] for item in segment)
+            candidates.append({
+                "text": text,
+                "amounts": amounts,
+                "confidence": sum(item["confidence"] for item in segment) / len(segment),
+                "rect": (left, top, right, bottom),
+                "direct": False,
+            })
+
+    unique: List[Dict[str, Any]] = []
+    seen: set[Tuple[int, int, int, int]] = set()
+    for candidate in sorted(
+        candidates,
+        key=lambda item: (
+            bool(item["amounts"]),
+            bool(item["direct"]),
+            float(item["confidence"]),
+        ),
+        reverse=True,
+    ):
+        rect_key = tuple(round(value / 4.0) for value in candidate["rect"])
+        if rect_key in seen:
+            continue
+        seen.add(rect_key)
+        unique.append(candidate)
+        if len(unique) >= 3:
+            break
+    return unique
+
+
+def _temporary_amount_crop(
+    image_path: Path,
+    rect: Sequence[float],
+    *,
+    grayscale: bool,
+) -> Path:
+    """Create a tightly padded and sharpened amount crop for re-reading."""
+    from PIL import Image, ImageFilter, ImageOps
+
+    with Image.open(image_path) as image:
+        image = image.convert("RGB")
+        width, height = image.size
+        left, top, right, bottom = (float(value) for value in rect)
+        box_height = max(1.0, bottom - top)
+        pad_x = max(12.0, 1.75 * box_height)
+        pad_y = max(8.0, 0.85 * box_height)
+        pixel_box = (
+            max(0, round(left - pad_x)),
+            max(0, round(top - pad_y)),
+            min(width, round(right + pad_x)),
+            min(height, round(bottom + pad_y)),
+        )
+        crop = image.crop(pixel_box)
+        if grayscale:
+            crop = ImageOps.autocontrast(crop.convert("L")).convert("RGB")
+        else:
+            crop = ImageOps.autocontrast(crop)
+        crop = crop.filter(ImageFilter.UnsharpMask(radius=1.2, percent=170, threshold=2))
+        scale = min(6.0, max(3.0, 220.0 / max(1, crop.height)))
+        if crop.width * scale > 4096:
+            scale = max(1.0, 4096.0 / crop.width)
+        crop = crop.resize(
+            (max(1, round(crop.width * scale)), max(1, round(crop.height * scale))),
+            Image.Resampling.LANCZOS,
+        )
+        temporary = tempfile.NamedTemporaryFile(
+            prefix="email_amount_", suffix=".png", delete=False,
+        )
+        temporary.close()
+        crop.save(temporary.name, format="PNG")
+        return Path(temporary.name)
+
+
+def _vision_amount_observation(crop_path: Path, model: str) -> Dict[str, Any]:
+    prompt = """
+Inspect only the monetary token in this tightly cropped email image.
+Read the currency glyph independently from the digits, then read every digit
+from left to right. Use only visible pixels and no contextual expectations.
+
+Return ONLY JSON:
+{
+  "currency": "exact visible currency symbol or code",
+  "digits": "digits only",
+  "formatted_amount": "exact complete amount",
+  "confidence": "high|medium|low"
+}
+
+Do not silently substitute one currency symbol or digit for another. Preserve
+the visible thousands and decimal separators. If any character is unreadable,
+leave formatted_amount empty and set confidence to low.
+""".strip()
+    return extract_json_object(
+        ollama_chat(
+            model,
+            [{"role": "user", "content": prompt, "images": [str(crop_path)]}],
+            num_predict=180,
+        )
+    )
+
+
+def verify_localized_amount_consensus(
+    image_path: Path,
+    model: str,
+    draft: Dict[str, Any],
+    langs: Sequence[str],
+    use_cpu: bool,
+) -> Dict[str, Any]:
+    """Confirm an amount only through cross-engine OCR/vision agreement."""
+    result: Dict[str, Any] = {
+        "status": "unavailable",
+        "amounts": [],
+        "observations": [],
+        "candidate_regions": 0,
+    }
+    try:
+        import easyocr
+        from PIL import Image
+    except Exception as exc:  # pragma: no cover - environment dependent
+        result["error"] = str(exc)
+        return result
+
+    reader = easyocr.Reader(list(langs), gpu=not use_cpu)
+    items = reader.readtext(str(image_path), detail=1, paragraph=False)
+    with Image.open(image_path) as image:
+        image_size = image.size
+    candidates = _amount_region_candidates_from_ocr(
+        items,
+        image_size=image_size,
+        draft=draft,
+    )
+    result["candidate_regions"] = len(candidates)
+    if not candidates:
+        result["status"] = "no_candidate_region"
+        return result
+
+    ocr_observations: List[Dict[str, Any]] = []
+    vision_observations: List[Dict[str, Any]] = []
+    temporary_paths: List[Path] = []
+    try:
+        for region_index, candidate in enumerate(candidates, start=1):
+            for amount in candidate.get("amounts", []):
+                normalized = _normalized_currency_amount(amount)
+                if normalized:
+                    ocr_observations.append({
+                        "source": "easyocr_full",
+                        "region": region_index,
+                        "verbatim": amount,
+                        "normalized": normalized,
+                        "confidence": float(candidate.get("confidence", 0.0)),
+                    })
+
+            crops = [
+                _temporary_amount_crop(image_path, candidate["rect"], grayscale=False),
+                _temporary_amount_crop(image_path, candidate["rect"], grayscale=True),
+            ]
+            temporary_paths.extend(crops)
+
+            # A restricted second OCR read reduces prose interference while
+            # remaining a different recognition engine from the vision model.
+            crop_items = reader.readtext(
+                str(crops[0]),
+                detail=1,
+                paragraph=False,
+                allowlist="€£$0123456789,.",
+            )
+            crop_text = normalize_space(" ".join(
+                normalize_space(item[1])
+                for item in crop_items
+                if isinstance(item, (list, tuple)) and len(item) >= 3
+                and float(item[2]) >= 0.10
+            ))
+            for amount in _extract_symbolic_amounts(crop_text):
+                normalized = _normalized_currency_amount(amount)
+                if normalized:
+                    confidences = [
+                        float(item[2]) for item in crop_items
+                        if isinstance(item, (list, tuple)) and len(item) >= 3
+                    ]
+                    ocr_observations.append({
+                        "source": "easyocr_amount_crop",
+                        "region": region_index,
+                        "verbatim": amount,
+                        "normalized": normalized,
+                        "confidence": max(confidences, default=0.0),
+                    })
+
+            for variant_index, crop_path in enumerate(crops, start=1):
+                observation = _vision_amount_observation(crop_path, model)
+                confidence = normalize_space(observation.get("confidence")).lower()
+                formatted = normalize_space(observation.get("formatted_amount"))
+                normalized = _normalized_currency_amount(formatted)
+                if normalized and confidence in {"high", "medium"}:
+                    vision_observations.append({
+                        "source": f"vision_amount_crop_{variant_index}",
+                        "region": region_index,
+                        "verbatim": formatted,
+                        "normalized": normalized,
+                        "confidence": confidence,
+                    })
+    finally:
+        for path in temporary_paths:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+    result["observations"] = ocr_observations + vision_observations
+    ocr_values = {
+        item["normalized"] for item in ocr_observations
+        if float(item.get("confidence", 0.0)) >= 0.15
+    }
+    vision_values = {item["normalized"] for item in vision_observations}
+    agreements = sorted(ocr_values & vision_values)
+    if len(agreements) != 1:
+        result["status"] = "no_unique_cross_engine_consensus"
+        return result
+
+    winner = agreements[0]
+    matching = [
+        item for item in result["observations"]
+        if item.get("normalized") == winner
+    ]
+    # Prefer the most explicit visible formatting among agreeing observations.
+    verbatim = max(
+        (normalize_space(item.get("verbatim")) for item in matching),
+        key=lambda value: (bool(re.search(r"[,.]", value)), len(value)),
+    )
+    result["status"] = "confirmed"
+    result["amounts"] = [{"verbatim": verbatim}]
+    result["normalized_consensus"] = winner
+    return result
+
+
+def apply_localized_amount_consensus(body: str, result: Dict[str, Any]) -> str:
+    """Replace one symbolic body amount after unique cross-engine consensus."""
+    value = str(body or "")
+    if result.get("status") != "confirmed":
+        return value
+    amounts = _verbatim_amounts(result)
+    body_pattern = re.compile(r"(?P<currency>[€£$])\s*(?P<number>\d[\d., ]*\d|\d)")
+    body_matches = list(body_pattern.finditer(value))
+    if len(amounts) != 1 or len(body_matches) != 1:
+        return value
+    replacement_match = body_pattern.search(amounts[0])
+    if replacement_match is None:
+        return value
+    replacement = replacement_match.group(0).replace(" ", "")
+    current = body_matches[0]
+    return value[:current.start()] + replacement + value[current.end():]
+
+
+def apply_verified_critical_evidence(
+    body: str,
+    verified: Dict[str, Any],
+    confirmed: Dict[str, Any] | None = None,
+) -> str:
+    """Correct a unique amount only when the focused visual evidence is safe."""
+    value = str(body or "")
+    verified_amounts = _verbatim_amounts(verified)
+    if not verified_amounts:
+        return value
+
+    body_pattern = re.compile(r"(?P<currency>[€£$])\s*(?P<number>\d[\d., ]*\d|\d)")
+    body_matches = list(body_pattern.finditer(value))
+
+    # When two independent focused reads agree and the body contains exactly
+    # one symbolic amount, the entire amount may be corrected (symbol + digits).
+    # This handles OCR confusions such as one currency symbol and one digit both
+    # being wrong, without using case-report or dataset values.
+    if confirmed is not None:
+        confirmed_amounts = _verbatim_amounts(confirmed)
+        if (
+            len(body_matches) == 1
+            and len(verified_amounts) == 1
+            and len(confirmed_amounts) == 1
+            and _normalized_currency_amount(verified_amounts[0])
+            and _normalized_currency_amount(verified_amounts[0])
+            == _normalized_currency_amount(confirmed_amounts[0])
+        ):
+            replacement = max(
+                (verified_amounts[0], confirmed_amounts[0]),
+                key=lambda item: len(re.sub(r"\s+", "", item)),
+            )
+            replacement_match = body_pattern.search(replacement)
+            if replacement_match:
+                current = body_matches[0]
+                exact = replacement_match.group(0).replace(" ", "")
+                return value[:current.start()] + exact + value[current.end():]
+        # A disagreement between independent visual reads is intentionally left
+        # unchanged for human review.
+        return value
+
+    # With only one verifier, allow the narrower correction of a currency symbol
+    # when the complete numeric payload already agrees.
+    for verbatim in verified_amounts:
+        verified_match = body_pattern.search(verbatim)
+        if not verified_match:
+            continue
+        key = _amount_numeric_key(verified_match.group("number"))
+        matching_body = [
+            match for match in body_matches
+            if _amount_numeric_key(match.group("number")) == key
+        ]
+        if len(matching_body) != 1:
+            continue
+        current = matching_body[0]
+        verified_symbol = verified_match.group("currency")
+        if current.group("currency") == verified_symbol:
+            continue
+        value = value[:current.start("currency")] + verified_symbol + value[current.end("currency"):]
+        body_matches = list(body_pattern.finditer(value))
+    return value
+
+
+def _needs_critical_verification(body: str) -> bool:
+    value = str(body or "")
+    return bool(re.search(
+        r"[€£$]|\b(?:EUR|USD|GBP|IBAN|account|beneficiary)\b|"
+        r"(?:https?://|www\.|\b[\w.+-]+@[\w.-]+\.)|@[A-Za-z0-9_]",
+        value,
+        flags=re.I,
+    ))
 
 
 
@@ -625,6 +1442,7 @@ def refine_layout_with_vision(
             "block_id": index,
             "existing_kind": normalize_space(block.get("kind")),
             "existing_flow": normalize_space(block.get("flow")),
+            "existing_region": normalize_space(block.get("region")),
             "text_preview": normalize_space(block.get("text"))[:240],
         })
 
@@ -638,7 +1456,8 @@ Return ONLY JSON with this schema:
     {{
       "block_id": 1,
       "kind": "body, closing, signature, contact, callout, table, footer, button, or other",
-      "flow": "primary or separate"
+      "flow": "primary or separate",
+      "region": "main_message, ancillary_sidebar, email_header, or application_ui"
     }}
   ]
 }}
@@ -648,6 +1467,7 @@ Rules:
 - plain_text means one continuous message column where paragraphs, inline payment details, closing, signature and signature contact remain in the same flow.
 - designed_html means a rich template with detached boxes, cards, columns, tables, support panels, badges, buttons, or decorative footers.
 - In designed_html, only introductory prose in the main article column is primary. Detached action/payment/parcel/support regions are separate.
+- region is independent from flow: a detached action or payment panel inside the authored message is main_message; a parallel informational/support column outside that reading flow is ancillary_sidebar.
 - Do not return primary_body, full_body_text, identities, subject, date, or rewritten block text.
 
 BLOCKS TO LABEL:
@@ -702,10 +1522,13 @@ def merge_layout_refinement(
             if label:
                 kind = normalize_space(label.get("kind")).lower()
                 flow = normalize_space(label.get("flow")).lower()
+                region = normalize_space(label.get("region")).lower()
                 if kind in {"body", "closing", "signature", "contact", "callout", "table", "footer", "button", "other"}:
                     updated["kind"] = kind
                 if flow in {"primary", "separate"}:
                     updated["flow"] = flow
+                if region in {"main_message", "ancillary_sidebar", "email_header", "application_ui"}:
+                    updated["region"] = region
             relabelled.append(updated)
         merged["content_blocks"] = relabelled
 
@@ -751,6 +1574,8 @@ Return ONLY the same JSON schema described below:
   "salutation": "",
   "subject": "",
   "layout_type": "plain_text, designed_html, or unknown",
+  "main_message_bbox": [],
+  "body_complete": true,
   "signature_contact": "",
   "content_blocks": [],
   "full_body_text": "",
@@ -760,7 +1585,8 @@ Return ONLY the same JSON schema described below:
 Apply these rules:
 - Exclude app UI, toolbar text, status-bar text, buttons, labels, counts, and reply controls.
 - For plain-text email, classify body, closing, signature, and signature contact as primary-flow content blocks.
-- For richly designed email, classify detached cards, boxes, tables, side panels, payment panels, support panels, badges, buttons, and automated footers as separate blocks.
+- Give each content block a region: main_message, ancillary_sidebar, email_header, or application_ui.
+- In richly designed email, embedded callouts/payment panels/signatures/disclaimers in the authored reading flow remain main_message even when flow is separate. Parallel side columns are ancillary_sidebar.
 - Put the greeting only in salutation and exclude it from full_body_text and primary_body.
 - full_body_text should contain all OCR-supported email-message content after the salutation in reading order.
 - Preserve OCR-supported wording; do not invent missing sentences.
@@ -1064,6 +1890,9 @@ def _compose_block_message(draft: Dict[str, Any], layout: str) -> str:
 
     included: List[str] = []
     for block in blocks:
+        region = normalize_space(block.get("region")).lower()
+        if region in {"ancillary_sidebar", "email_header", "application_ui"}:
+            continue
         text = str(block.get("text") or "").strip()
         if not text:
             continue
@@ -1284,7 +2113,17 @@ def _should_append_signature_contact(
         for block in blocks
     )
     if layout == "designed_html":
-        return _contains_closing_or_signature(body)
+        contact_folded = _fold_identity_text(signature_contact)
+        supported_by_main_signature = any(
+            normalize_space(block.get("region")).lower()
+            not in {"ancillary_sidebar", "email_header", "application_ui"}
+            and normalize_space(block.get("kind")).lower() in {"signature", "contact"}
+            and contact_folded in _fold_identity_text(block.get("text"))
+            for block in blocks
+        )
+        # A contact copied from a designed email's parallel support sidebar is
+        # not a signature contact. Require block-level main-message evidence.
+        return supported_by_main_signature
     return _contains_closing_or_signature(body) or has_primary_signature_block
 
 
@@ -1295,6 +2134,34 @@ def _repair_split_evidence_identifiers(text: str) -> str:
         "com|net|org|edu|gov|mil|int|io|ai|co|uk|gr|eu|de|fr|it|es|nl|"
         "be|ch|at|us|ca|au|info|biz|online|site|app|dev|tech|me|tv"
     )
+
+    # Normalize unmistakable email-address spans as indivisible identifiers.
+    # This covers spaces around @ and around any domain dot, not only the final
+    # top-level-domain separator.
+    spaced_email = re.compile(
+        rf"\b[A-Za-z0-9._%+-]+\s*@\s*[A-Za-z0-9-]+"
+        rf"(?:\s*\.\s*[A-Za-z0-9-]+)*\s*\.\s*(?:{tlds})\b",
+        flags=re.I,
+    )
+    value = spaced_email.sub(
+        lambda match: re.sub(r"\s+", "", match.group(0)),
+        value,
+    )
+
+    # Normalize complete website spans. Whitespace is illegal inside a URL and
+    # therefore safe to remove once a scheme/www prefix and dotted host have
+    # made the span unambiguous.
+    spaced_website = re.compile(
+        rf"\b(?:(?:https?|ftp)\s*:\s*/\s*/|www\s*\.\s*)"
+        rf"\s*[A-Za-z0-9-]+(?:\s*\.\s*[A-Za-z0-9-]+)*"
+        rf"\s*\.\s*(?:{tlds})\b",
+        flags=re.I,
+    )
+    value = spaced_website.sub(
+        lambda match: re.sub(r"\s+", "", match.group(0)),
+        value,
+    )
+
     value = re.sub(
         rf"\b(?i:https)\s+(?:[:/\\|]+|I[lI]|l[I|])\s*"
         rf"(?=[A-Za-z0-9][A-Za-z0-9.-]*[-A-Za-z0-9]\s+(?:{tlds})\b)",
@@ -1306,6 +2173,13 @@ def _repair_split_evidence_identifiers(text: str) -> str:
         r"\1.\2",
         value,
         flags=re.I,
+    )
+    value = re.sub(r"(?i)\bwww\s*\.\s*", "www.", value)
+    value = re.sub(
+        r"(?i)((?:https?://|www\.))"
+        r"([A-Za-z0-9-]+(?:\s*\.\s*[A-Za-z0-9-]+)+)",
+        lambda match: match.group(1) + re.sub(r"\s*\.\s*", ".", match.group(2)),
+        value,
     )
     scheme_host = r"((?:https?://|www\.)[A-Za-z0-9][A-Za-z0-9.-]*[A-Za-z0-9-])"
     value = re.sub(
@@ -1410,6 +2284,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--debug-dir", default=None, help="Optional debug directory.")
     parser.add_argument("--dump-ocr", action="store_true")
     parser.add_argument("--dump-draft", action="store_true")
+    parser.add_argument(
+        "--no-body-refinement",
+        action="store_true",
+        help="Disable the focused main-message transcription pass (for ablation testing).",
+    )
+    parser.add_argument(
+        "--no-critical-verification",
+        action="store_true",
+        help="Disable the focused amount/currency/identifier verification pass.",
+    )
 
     # Compatibility with mass_extract.py's common extractor command.
     parser.add_argument("--emoji-mode", default="omit", choices=["omit", "vision"])
@@ -1445,6 +2329,12 @@ def main() -> int:
 
         draft: Dict[str, Any]
         layout_refined: Dict[str, Any] = {}
+        body_refined: Dict[str, Any] = {}
+        body_retry: Dict[str, Any] = {}
+        body_retry_reasons: List[str] = []
+        critical_verified: Dict[str, Any] = {}
+        amount_confirmed: Dict[str, Any] = {}
+        localized_amount_verified: Dict[str, Any] = {}
         opening_refined: Dict[str, Any] = {}
         message_debug: Dict[str, Any] = {}
         ocr_lines: List[str] = []
@@ -1477,6 +2367,36 @@ def main() -> int:
             except Exception as layout_exc:
                 print(f"[WARN] Layout refinement failed; using first-pass draft: {layout_exc}")
 
+        if not args.no_vision and not args.no_body_refinement:
+            try:
+                body_refined = transcribe_main_body_with_vision(
+                    image_path,
+                    args.model,
+                    draft,
+                )
+                draft, accepted = merge_body_refinement(draft, body_refined)
+                if not accepted:
+                    print("[WARN] Focused body pass failed evidence-overlap checks; keeping first-pass body.")
+            except Exception as body_exc:
+                print(f"[WARN] Focused body transcription failed; keeping first-pass body: {body_exc}")
+
+            body_after_refinement, _, _ = _select_message_body(draft)
+            body_retry_reasons = body_incompleteness_reasons(draft, body_after_refinement)
+            if body_retry_reasons:
+                try:
+                    body_retry = transcribe_main_body_with_vision(
+                        image_path,
+                        args.model,
+                        draft,
+                        current_body=body_after_refinement,
+                        retry_reasons=body_retry_reasons,
+                    )
+                    draft, accepted = merge_body_refinement(draft, body_retry)
+                    if not accepted:
+                        print("[WARN] Body completeness retry failed evidence-overlap checks; keeping previous body.")
+                except Exception as body_retry_exc:
+                    print(f"[WARN] Body completeness retry failed; keeping previous body: {body_retry_exc}")
+
         resolved = resolve_draft_with_report(draft, report_text, args.model)
         selected_body, effective_layout, body_candidates = _select_message_body(draft)
         if not args.no_vision and _opening_needs_repair(selected_body):
@@ -1490,11 +2410,82 @@ def main() -> int:
             except Exception as opening_exc:
                 print(f"[WARN] Opening verification failed; keeping first-pass text: {opening_exc}")
 
+        message = choose_message(
+            draft,
+            resolved,
+            report_text,
+            selected_body=selected_body,
+            effective_layout=effective_layout,
+            opening_refined=opening_refined,
+        )
+        if (
+            not args.no_vision
+            and not args.no_critical_verification
+            and _needs_critical_verification(message)
+        ):
+            try:
+                critical_verified = verify_critical_evidence_with_vision(
+                    image_path,
+                    args.model,
+                    draft,
+                    message,
+                )
+                if _has_currency_amount(message):
+                    amount_confirmed = verify_amounts_with_second_vision_pass(
+                        image_path,
+                        args.model,
+                        draft,
+                    )
+                    localized_amount_verified = verify_localized_amount_consensus(
+                        image_path,
+                        args.model,
+                        draft,
+                        [value.strip() for value in args.langs.split(",") if value.strip()] or ["en"],
+                        args.cpu,
+                    )
+                    print(
+                        "[INFO] Localized amount verification: "
+                        f"status={localized_amount_verified.get('status', 'unavailable')} "
+                        f"candidates={localized_amount_verified.get('candidate_regions', 0)} "
+                        f"consensus={localized_amount_verified.get('normalized_consensus', '') or '<none>'}"
+                    )
+
+                if localized_amount_verified.get("status") == "confirmed":
+                    message = apply_localized_amount_consensus(
+                        message,
+                        localized_amount_verified,
+                    )
+                elif localized_amount_verified.get("status") in {
+                    "no_unique_cross_engine_consensus",
+                    "no_candidate_region",
+                }:
+                    # A localized but unresolved amount must not be overridden
+                    # by two correlated broad reads from the same vision model.
+                    pass
+                else:
+                    # Compatibility fallback when localized verification cannot
+                    # run, for example because EasyOCR/Pillow is unavailable.
+                    message = apply_verified_critical_evidence(
+                        message,
+                        critical_verified,
+                        amount_confirmed if amount_confirmed else None,
+                    )
+            except Exception as critical_exc:
+                print(f"[WARN] Critical-evidence verification failed; keeping transcription: {critical_exc}")
+
+        # Final deterministic invariant: no OCR/line-wrap whitespace may remain
+        # inside an unmistakable website or email-address token.
+        message = _repair_split_evidence_identifiers(message)
+
         message_debug = {
             "effective_layout": effective_layout,
             "selected_body_before_opening_repair": selected_body,
             "body_candidates": body_candidates,
+            "body_retry_reasons": body_retry_reasons,
             "opening_refined": opening_refined,
+            "critical_verified": critical_verified,
+            "amount_confirmed": amount_confirmed,
+            "localized_amount_verified": localized_amount_verified,
         }
         normalized_email_date = normalize_date(
             resolved.get("date_text") or draft.get("date_text"), report_year,
@@ -1503,14 +2494,7 @@ def main() -> int:
             "Time": f"{normalized_email_date} 00:00:00" if normalized_email_date else "",
             "Sender": choose_sender(draft, resolved, report_text),
             "Receiver": choose_receiver(draft, resolved, report_text),
-            "Message": choose_message(
-                draft,
-                resolved,
-                report_text,
-                selected_body=selected_body,
-                effective_layout=effective_layout,
-                opening_refined=opening_refined,
-            ),
+            "Message": message,
         }
         # Persist diagnostic data before validation so failed records remain
         # inspectable instead of leaving an empty debug directory.
@@ -1520,6 +2504,14 @@ def main() -> int:
                 dump_json(debug_dir / "email_draft.json", draft)
                 if layout_refined:
                     dump_json(debug_dir / "email_layout_refined.json", layout_refined)
+                if body_refined:
+                    dump_json(debug_dir / "email_body_refined.json", body_refined)
+                if body_retry:
+                    dump_json(debug_dir / "email_body_retry.json", body_retry)
+                if critical_verified:
+                    dump_json(debug_dir / "email_critical_verified.json", critical_verified)
+                if amount_confirmed:
+                    dump_json(debug_dir / "email_amount_confirmed.json", amount_confirmed)
                 if opening_refined:
                     dump_json(debug_dir / "email_opening_refined.json", opening_refined)
                 dump_json(debug_dir / "email_message_debug.json", message_debug)
