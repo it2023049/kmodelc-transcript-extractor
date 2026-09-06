@@ -53,6 +53,12 @@ DEFAULT_AUDIO_MODEL_ID = "OpenMOSS-Team/MOSS-Transcribe-Diarize"
 AUDIO_DUPLICATE_ROW_SEQUENCE_THRESHOLD = 0.88
 AUDIO_DUPLICATE_TOKEN_CONTAINMENT_THRESHOLD = 0.85
 AUDIO_DUPLICATE_MIN_TOKENS = 8
+# Inferred audio dates are contextual estimates, not intrinsic recording
+# identifiers.  When two candidates received different inferred dates, require
+# substantially stronger transcript agreement before treating one as covered
+# by the other.
+AUDIO_DUPLICATE_CROSS_DATE_ROW_SEQUENCE_THRESHOLD = 0.96
+AUDIO_DUPLICATE_CROSS_DATE_TOKEN_CONTAINMENT_THRESHOLD = 0.95
 
 @dataclass
 class EvidenceSource:
@@ -637,14 +643,22 @@ def classify_platform(
             platform = classify_by_filename(image_path)
         return platform
 
-    # Default: auto.  Inspect the pixels first so a profile/contact screen in a
-    # directory named ``facebook`` or ``viber`` is not sent to a chat
-    # extractor merely because of its path.  Filename hints remain a safe
-    # fallback when the VLM is unavailable or genuinely unsure.
-    platform = classify_platform_with_vlm(image_path, model)
-    if platform != "unknown":
-        return platform
-    return classify_by_filename(image_path)
+    # Default: auto. Prefer a deterministic platform hint from the filename or
+    # directory whenever one is available. This prevents a valid chat image
+    # from being dropped when the VLM incorrectly labels it as ``non_chat``.
+    # Profile/contact screenshots are still handled safely by the zero-row
+    # verification performed after the selected chat extractor runs.
+    filename_platform = classify_by_filename(image_path)
+    if filename_platform in {"facebook", "viber", "email"}:
+        print(
+            "-> [CLASSIFY] Using deterministic filename/path hint: "
+            f"{filename_platform}"
+        )
+        return filename_platform
+
+    # With no reliable path hint, inspect the actual image. In auto mode the
+    # VLM result is authoritative because there is no deterministic fallback.
+    return classify_platform_with_vlm(image_path, model)
 
 def classify_zero_row_image(image_path: Path, model: str) -> str:
     """Distinguish a real empty/failed chat from a non-conversation profile UI."""
@@ -1500,8 +1514,7 @@ def audio_candidate_coverage(
 
     duplicate_date = str(duplicate.record.get("inferred_date", "")).strip()
     canonical_date = str(canonical.record.get("inferred_date", "")).strip()
-    if not duplicate_date or duplicate_date != canonical_date:
-        return None
+    dates_match = bool(duplicate_date and duplicate_date == canonical_date)
     if not duplicate.rows or len(duplicate.rows) > len(canonical.rows):
         return None
 
@@ -1513,6 +1526,17 @@ def audio_candidate_coverage(
         for index in available:
             details = audio_row_match_details(duplicate_row, canonical.rows[index])
             if details is None:
+                continue
+            # Different or missing dates must not block duplicate detection:
+            # these dates were inferred after transcription and may vary
+            # between otherwise identical runs.  Compensate by requiring
+            # near-exact transcript agreement for cross-date matches.
+            if not dates_match and (
+                details["sequence_ratio"]
+                < AUDIO_DUPLICATE_CROSS_DATE_ROW_SEQUENCE_THRESHOLD
+                or details["token_containment"]
+                < AUDIO_DUPLICATE_CROSS_DATE_TOKEN_CONTAINMENT_THRESHOLD
+            ):
                 continue
             if (
                 best_details is None
@@ -1527,10 +1551,16 @@ def audio_candidate_coverage(
         matches.append(best_details)
 
     return {
-        "method": "covered_transcript_rows",
+        "method": (
+            "covered_transcript_rows"
+            if dates_match
+            else "covered_transcript_rows_cross_date"
+        ),
         "matched_rows": len(matches),
         "minimum_sequence_ratio": min(item["sequence_ratio"] for item in matches),
         "minimum_token_containment": min(item["token_containment"] for item in matches),
+        "duplicate_inferred_date": duplicate_date,
+        "canonical_inferred_date": canonical_date,
     }
 
 def audio_candidate_quality(candidate: AudioCandidate) -> Tuple[Any, ...]:
@@ -1597,6 +1627,12 @@ def deduplicate_audio_candidates(
             "row_sequence_ratio": AUDIO_DUPLICATE_ROW_SEQUENCE_THRESHOLD,
             "token_containment": AUDIO_DUPLICATE_TOKEN_CONTAINMENT_THRESHOLD,
             "minimum_unique_tokens": AUDIO_DUPLICATE_MIN_TOKENS,
+            "cross_date_row_sequence_ratio": (
+                AUDIO_DUPLICATE_CROSS_DATE_ROW_SEQUENCE_THRESHOLD
+            ),
+            "cross_date_token_containment": (
+                AUDIO_DUPLICATE_CROSS_DATE_TOKEN_CONTAINMENT_THRESHOLD
+            ),
         },
         "decisions": [],
     }
