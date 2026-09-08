@@ -602,9 +602,15 @@ def deterministic_viber_side_map(
     # -------------------------
     # 1. Header evidence wins
     # -------------------------
-    header_name = find_header_match(ocr_data, actors)
+    # A complete person name that is visibly present in the Viber header and
+    # also occurs in the case report is stronger identity evidence than a
+    # phone number inherited from a broad/flattened report section.  In
+    # particular, one number can be repeated in a report near several actors,
+    # while the current screenshot header directly identifies the contact.
+    # This rule remains report-grounded: an OCR-only name is never accepted.
+    header_name = find_report_grounded_header_match(ocr_data, report_text)
     if not header_name:
-        header_name = find_report_grounded_header_match(ocr_data, report_text)
+        header_name = find_header_match(ocr_data, actors)
 
     if header_name and victim and not same_name(header_name, victim):
         return {
@@ -1109,10 +1115,11 @@ def build_ocr_bubble_groups(
             to_int(row.get("h", "1"), 1),
         )
         # Wrapped lines in one bubble can receive different side labels when a
-        # wide dark bubble crosses the geometric boundary. Vertical proximity
-        # is stronger evidence than that per-line label. A visible timestamp
-        # still emits the preceding bubble before this rule is reached.
-        if gap <= max(45, int(height * 0.70)):
+        # wide dark bubble crosses the geometric boundary. Their OCR boxes
+        # normally overlap vertically or have only a very small gap. Do not,
+        # however, merge two distinct compact rounded bubbles merely because
+        # they have the same side and timestamp.
+        if gap <= max(34, int(height * 0.42)):
             return False
         if prev_side in {"LEFT", "RIGHT"} and next_side in {"LEFT", "RIGHT"} and prev_side != next_side:
             return True
@@ -1203,7 +1210,56 @@ def build_ocr_bubble_groups(
                 current = []
             current.append(row)
 
-    return groups
+    return repair_isolated_viber_hour_errors(groups)
+
+
+def repair_isolated_viber_hour_errors(
+    groups: List[Dict[str, str]],
+) -> List[Dict[str, str]]:
+    """Repair a strongly constrained OCR error in one bubble's hour.
+
+    A timestamp is corrected only when both adjacent visible bubbles use the
+    same hour, the current minute falls between their minutes, and the
+    suspicious hour differs from the shared hour by exactly one character.
+    This uses only local chronological evidence and never inserts a timestamp
+    that is not supported by its two neighbours.
+    """
+    repaired = [dict(group) for group in groups]
+    if len(repaired) < 3:
+        return repaired
+
+    def parse_hhmm(value: str) -> Optional[Tuple[str, int]]:
+        match = re.fullmatch(r"(\d{2}):(\d{2})", str(value or "").strip())
+        if not match:
+            return None
+        hour, minute = match.group(1), int(match.group(2))
+        if int(hour) > 23 or minute > 59:
+            return None
+        return hour, minute
+
+    for index in range(1, len(repaired) - 1):
+        previous = parse_hhmm(repaired[index - 1].get("time", ""))
+        current = parse_hhmm(repaired[index].get("time", ""))
+        following = parse_hhmm(repaired[index + 1].get("time", ""))
+        if not previous or not current or not following:
+            continue
+
+        previous_hour, previous_minute = previous
+        current_hour, current_minute = current
+        following_hour, following_minute = following
+
+        if previous_hour != following_hour or current_hour == previous_hour:
+            continue
+        if sum(a != b for a, b in zip(current_hour, previous_hour)) != 1:
+            continue
+        lower = min(previous_minute, following_minute)
+        upper = max(previous_minute, following_minute)
+        if not lower <= current_minute <= upper:
+            continue
+
+        repaired[index]["time"] = f"{previous_hour}:{current_minute:02d}"
+
+    return repaired
 
 def build_viber_bubble_hints(ocr_bubble_groups: Optional[List[Dict[str, str]]]) -> str:
     """Formats Viber OCR bubble groups as prompt hints."""
@@ -1788,18 +1844,37 @@ def process_viber_image(
     for idx, screen_ocr in enumerate(all_screen_ocr, start=1):
         print(f"-> [LLM] Extracting screen #{idx} as Side CSV...")
 
-        visible_date = extract_visible_date_from_ocr(
+        # Detect an explicit separator independently from the inherited hint.
+        # A collage splitter may place the date separator in its own crop and
+        # the actual message bubbles in the following crops. Persist the date
+        # immediately, even when the date-only crop produces no chat row.
+        explicit_visible_date = extract_visible_date_from_ocr(
             screen_ocr,
             default_year=default_year,
-            previous_date_hint=previous_date_hint,
+            previous_date_hint="",
         )
+        if explicit_visible_date:
+            previous_date_hint = explicit_visible_date
+            save_conversation_date_hint(
+                conversation_state_cache,
+                conversation_key,
+                explicit_visible_date,
+            )
+        visible_date = explicit_visible_date or previous_date_hint
 
-        # Limit accepted times to times actually visible in this screen.
-        allowed_times = extract_allowed_times_from_ocr(screen_ocr)
+        # Limit accepted times to message-bubble times. The bubble grouping also
+        # applies a tightly constrained local correction for an isolated hour
+        # OCR error between two chronologically consistent neighbouring rows.
         ocr_bubble_groups = build_ocr_bubble_groups(
             screen_ocr,
             allow_top_content=bool(previous_date_hint),
         )
+        grouped_times = {
+            str(group.get("time", "")).strip()
+            for group in ocr_bubble_groups
+            if re.fullmatch(r"\d{2}:\d{2}", str(group.get("time", "")).strip())
+        }
+        allowed_times = grouped_times or extract_allowed_times_from_ocr(screen_ocr)
         bubble_hints = build_viber_bubble_hints(ocr_bubble_groups)
 
         if dump_draft:
