@@ -362,15 +362,31 @@ def looks_like_date(text: str) -> bool:
     """Checks whether text looks like a chat date label."""
     t = text.strip()
 
+    month = (
+        r"(?:Jan|January|Feb|February|Mar|March|Apr|April|May|Jun|June|"
+        r"Jul|July|Aug|August|Sep|Sept|September|Oct|October|Nov|November|"
+        r"Dec|December)"
+    )
+
     if re.fullmatch(
-        r"(?:Jan|January|Feb|February|Mar|March|Apr|April|May|Jun|June|Jul|July|Aug|August|Sep|Sept|September|Oct|October|Nov|November|Dec|December)\s+\d{1,2}",
+        rf"{month}\s+\d{{1,2}}",
         t,
         flags=re.I,
     ):
         return True
 
     if re.search(
-        r"(?:Jan|January|Feb|February|Mar|March|Apr|April|May|Jun|June|Jul|July|Aug|August|Sep|Sept|September|Oct|October|Nov|November|Dec|December)\s+\d{1,2},?\s+\d{4}",
+        rf"{month}\s+\d{{1,2}},?\s+\d{{4}}",
+        t,
+        flags=re.I,
+    ):
+        return True
+
+    # Mobile applications also render day-first separators such as
+    # "07 April" and "7 Apr 2026". Treating them as message text creates a
+    # false CSV row even though the date parser already understands them.
+    if re.fullmatch(
+        rf"\d{{1,2}}\s+{month}(?:,?\s+\d{{4}})?",
         t,
         flags=re.I,
     ):
@@ -380,20 +396,32 @@ def looks_like_date(text: str) -> bool:
 
 def looks_like_time(text: str) -> bool:
     """Checks whether text looks like an HH:MM time token."""
-    t = text.strip()
-    t = re.sub(r"\s*(vi|v|✓|✔|✔✔)+\s*$", "", t, flags=re.I)
-    t = t.replace("*", ":").replace(",", ":").replace(";", ":").replace(".", ":")
-    return bool(re.fullmatch(r"\d{1,2}:\d{2}", t))
+    return normalize_visible_time_token(text) is not None
 
 def looks_like_date_or_time(text: str) -> bool:
     """Checks whether text is a date label or time token."""
     return looks_like_date(text) or looks_like_time(text)
 
 def normalize_visible_time_token(text: str) -> Optional[str]:
-    """Normalizes noisy OCR time text into HH:MM format."""
+    """Normalize a standalone, possibly OCR-damaged, time to HH:MM.
+
+    Confusable glyph repair is deliberately limited to a token that otherwise
+    has the shape of a clock. This recovers values such as ``Ji00`` and
+    ``Ii04`` without rewriting ordinary message words.
+    """
     t = text.strip()
     t = re.sub(r"\s*(vi|v|✓|✔|✔✔)+\s*$", "", t, flags=re.I)
+    t = re.sub(r"\s+", "", t)
     t = t.replace("*", ":").replace(",", ":").replace(";", ":").replace(".", ":")
+
+    # EasyOCR frequently confuses the narrow digits 1/0 in tiny timestamps.
+    if re.fullmatch(r"[0-9IJilOo]{4}", t):
+        t = t[:2] + ":" + t[2:]
+    if re.fullmatch(r"[0-9IJilOo]{1,2}:[0-9IJilOo]{2}", t):
+        t = t.translate(str.maketrans({
+            "I": "1", "J": "1", "i": "1", "l": "1",
+            "O": "0", "o": "0",
+        }))
 
     m = re.fullmatch(r"(\d{1,2}):(\d{2})", t)
     if not m:
@@ -406,6 +434,29 @@ def normalize_visible_time_token(text: str) -> Optional[str]:
         return None
 
     return f"{hh:02d}:{mm:02d}"
+
+
+def split_trailing_visible_time_token(text: str) -> Tuple[str, Optional[str]]:
+    """Split an inline trailing Viber timestamp from message text.
+
+    Viber renders a tiny timestamp inside the bubble. OCR can therefore return
+    one block such as ``without delay: 08:16`` or ``promise you that. 11,01``.
+    Only a valid clock-shaped token at the end is removed.
+    """
+    value = str(text or "").strip()
+    receipt_match = re.search(r"\s*(?:vi|v|✓|✔|✔✔)+\s*$", value, flags=re.I)
+    body = value[:receipt_match.start()].rstrip() if receipt_match else value
+    match = re.search(
+        r"(?P<time>[0-9IJilOo]{1,2}\s*[:*.,;]?\s*[0-9IJilOo]{2})\s*$",
+        body,
+    )
+    if not match:
+        return value, None
+    normalized = normalize_visible_time_token(match.group("time"))
+    if not normalized:
+        return value, None
+    prefix = body[:match.start()].rstrip()
+    return prefix, normalized
 
 def parse_ocr_lines(ocr_data: str) -> List[Dict[str, str]]:
     """Parses positioned OCR debug text into row dictionaries."""
@@ -474,7 +525,7 @@ def extract_allowed_times_from_ocr(screen_ocr: str) -> Set[str]:
         if date_y is None and y < 250:
             continue
 
-        t = normalize_visible_time_token(row["text"])
+        _, t = split_trailing_visible_time_token(row["text"])
         if t:
             allowed.add(t)
 
@@ -628,6 +679,13 @@ def infer_report_actors(report_text: str, model: str) -> Dict:
 
     victim_patterns = [
         r"VICTIM\s*/\s*COMPLAINANT:.*?Full Name:\s*([^\n\r•]+)",
+        # PyPDF2 commonly flattens form labels and values with one plain space
+        # rather than a colon or layout-preserving multi-space columns.
+        r"(?m)^\s*Statement\s+of[ \t]+([^\n\r•]+)",
+        r"(?m)^\s*Full Name[ \t]+([^\n\r•]+)",
+        r"(?m)^\s*Complainant[ \t]+([^\n\r•]+)",
+        r"(?m)^\s*Full Name\s{2,}([^\n\r•]+)",
+        r"(?m)^\s*Complainant\s{2,}([^\n\r•]+)",
         r"Full Name:\s*([^\n\r•]+)",
         r"Target/Victim:\s*([^\n\r•]+)",
     ]
@@ -667,6 +725,54 @@ def infer_report_actors(report_text: str, model: str) -> Dict:
                 "name": suspect_name,
                 "role": "suspect",
                 "contact_numbers": phones
+            })
+
+    # -------------------------
+    # Structured participant tables
+    # -------------------------
+    # PDF text extraction commonly flattens a table into lines such as:
+    #   First Last    Presented himself ...   Viber number +44 ...
+    # The old parser missed these people because they were not labelled
+    # "Suspect 1". Restrict the scan to the direct-communications section so
+    # organisations and payment beneficiaries do not become chat actors.
+    table_match = re.search(
+        r"PEOPLE\s+I\s+COMMUNICATED\s+WITH\s+DIRECTLY(.*?)(?=\n\s*3\.\s+)",
+        report_text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if table_match:
+        table_text = table_match.group(1)
+        name_row_pattern = re.compile(
+            r"(?m)^\s*([A-Z][A-Za-z'’.-]+(?:\s+[A-Z][A-Za-z'’().-]+){1,4})"
+            r"[ \t]+(?=(?:Presented|Complainant\s*/\s*victim)\b)"
+        )
+        name_rows = list(name_row_pattern.finditer(table_text))
+        for index, match in enumerate(name_rows):
+            person_name = clean_name(match.group(1))
+            if not person_name or not _looks_like_human_name(person_name):
+                continue
+            block_end = (
+                name_rows[index + 1].start()
+                if index + 1 < len(name_rows)
+                else len(table_text)
+            )
+            person_block = table_text[match.start():block_end]
+            phones = list(dict.fromkeys(
+                phone.strip() for phone in phone_pattern.findall(person_block)
+            ))
+            existing = next(
+                (p for p in participants if same_name(person_name, p.get("name", ""))),
+                None,
+            )
+            if existing:
+                existing["contact_numbers"] = list(dict.fromkeys(
+                    list(existing.get("contact_numbers", [])) + phones
+                ))
+                continue
+            participants.append({
+                "name": person_name,
+                "role": "victim" if same_name(person_name, victim) else "suspect",
+                "contact_numbers": phones,
             })
 
     # -------------------------
@@ -1001,6 +1107,20 @@ def conservative_clean_message_text(message: str) -> str:
         msg,
     )
 
+    # EasyOCR can confuse the capital pronoun I with digit 1. Restrict this
+    # repair to sentence starts followed by a common first-person verb so a
+    # genuine quantity elsewhere in evidence is never rewritten.
+    first_person_verbs = (
+        r"am|appreciate|believe|can|cannot|can't|completed|could|did|do|don't|"
+        r"feel|have|hope|just|know|love|may|must|need|promise|should|think|"
+        r"tried|trust|want|will|wish|would"
+    )
+    msg = re.sub(
+        rf"(?i)(^|[.!?]\s+)1\s+(?=(?:{first_person_verbs})\b)",
+        lambda m: f"{m.group(1)}I ",
+        msg,
+    )
+
     compact_i = {
         "just": "just",
         "will": "will",
@@ -1294,7 +1414,7 @@ def split_side_row_by_known_boundaries(row: List[str]) -> List[List[str]]:
         return []
     return [[time_value, side, msg]]
 
-def postprocess_side_csv_rows(side_csv: str) -> str:
+def postprocess_side_csv_rows(side_csv: str, merge_continuations: bool = True) -> str:
     """Generic side-CSV cleanup: near-duplicate removal and safe continuation merges."""
     rows = []
     for _row in _side_csv_rows(side_csv):
@@ -1327,7 +1447,13 @@ def postprocess_side_csv_rows(side_csv: str) -> str:
             prev = merged[-1]
             close_time = _minutes_apart(prev[0], row[0])
             close_enough = close_time is None or close_time <= 1
-            if prev[1] == row[1] and _same_day(prev[0], row[0]) and close_enough and should_merge_continuation(prev[2], row[2]):
+            if (
+                merge_continuations
+                and prev[1] == row[1]
+                and _same_day(prev[0], row[0])
+                and close_enough
+                and should_merge_continuation(prev[2], row[2])
+            ):
                 prev[2] = conservative_clean_message_text(prev[2] + " " + row[2])
                 continue
         row[2] = conservative_clean_message_text(row[2])
@@ -1804,16 +1930,14 @@ def _hard_side_constraints(cue_rows: Sequence[Dict[str, Any]]) -> Dict[str, Dict
     """Build unambiguous sender/receiver requirements for each visual side.
 
     Speaker prefixes and self-identification constrain the sender on the same
-    side.  Direct address constrains the receiver, which is the identity on the
-    opposite side.  A requirement is enforced only when all strong cues for a
-    side agree; conflicting OCR cues remain soft evidence instead of creating
-    an impossible rule.
+    side. Direct address is intentionally handled per row: a reconstructed or
+    forwarded bubble may contradict the usual visual-side owner without making
+    the entire conversation mapping invalid.
     """
     raw: Dict[str, Dict[str, List[str]]] = {
         "LEFT": {"sender": [], "receiver": []},
         "RIGHT": {"sender": [], "receiver": []},
     }
-    side_labels_reliable = _side_labels_are_reliable(cue_rows)
     for row in cue_rows:
         side = str(row.get("side", "")).upper()
         if side not in raw:
@@ -1821,11 +1945,8 @@ def _hard_side_constraints(cue_rows: Sequence[Dict[str, Any]]) -> Dict[str, Dict
         raw[side]["sender"].extend(row.get("speaker_prefix", []) or [])
         raw[side]["sender"].extend(row.get("self_identification", []) or [])
 
-        # Direct address becomes a hard receiver constraint only when both
-        # visual sides are represented.  Otherwise it remains soft pair
-        # evidence and cannot orient an entire same-side extraction.
-        if side_labels_reliable:
-            raw[side]["receiver"].extend(row.get("direct_address", []) or [])
+        # Direct-address cues remain soft at conversation level and are
+        # enforced only for the individual row in apply_side_mapping().
 
     constraints: Dict[str, Dict[str, List[str]]] = {
         "LEFT": {"sender": [], "receiver": []},
@@ -2000,26 +2121,19 @@ def _score_context_mapping(
                 hard += 1
                 contradictions.append(f"row {index}: self-identification says {name}, mapped sender is {sender}")
 
-        # Direct address identifies the recipient, not a third party.  It
-        # is a hard orientation cue only when both visual sides are present.
-        # With a same-side extraction it stays soft, because one greeting or
-        # vocative must not reverse every message in the screenshot.
+        # Direct address identifies the recipient of this particular message,
+        # but must not reverse every message in the screenshot. Keep it as soft
+        # pair evidence here; apply_side_mapping handles a contradiction locally.
         for name in row.get("direct_address", []) or []:
             if same_name(receiver, name):
-                score += 62 if side_labels_reliable else 20
-                if side_labels_reliable:
-                    strong += 1
+                score += 20
                 strong_by_name[normalize_name(name)] = strong_by_name.get(normalize_name(name), 0) + 1
                 support.append(f"row {index}: direct address supports {name} as receiver")
             elif same_name(sender, name):
-                score -= 82 if side_labels_reliable else 22
-                if side_labels_reliable:
-                    hard += 1
+                score += 8
                 contradictions.append(f"row {index}: message directly addresses {name}, but {name} is mapped as sender")
             else:
-                score -= 95 if side_labels_reliable else 35
-                if side_labels_reliable:
-                    hard += 1
+                score -= 35
                 contradictions.append(f"row {index}: directly addressed {name} is absent from the pair")
 
         # Third-party mentions are tracked separately and never become positive
@@ -2543,6 +2657,27 @@ def load_conversation_side_map(
     return {}
 
 
+def load_conversation_date_hint(
+    cache_path: Optional[str],
+    conversation_key: str,
+) -> str:
+    """Load the last visible date for the same evidence-folder conversation."""
+    if not cache_path or not conversation_key:
+        return ""
+    path = Path(cache_path)
+    if not path.exists():
+        return ""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        record = (data.get("conversations", {}) or {}).get(conversation_key, {}) or {}
+        value = str(record.get("last_visible_date", "")).strip()
+        if re.fullmatch(r"\d{2}/\d{2}/\d{4}", value):
+            return value
+    except Exception:
+        return ""
+    return ""
+
+
 def save_conversation_side_map(
     cache_path: Optional[str],
     conversation_key: str,
@@ -2577,16 +2712,47 @@ def save_conversation_side_map(
                 data.update(loaded)
                 if not isinstance(data.get("conversations"), dict):
                     data["conversations"] = {}
+        previous_record = data["conversations"].get(conversation_key, {}) or {}
         data["conversations"][conversation_key] = {
             "LEFT": mapping["LEFT"],
             "RIGHT": mapping["RIGHT"],
             "source_hint": str(source_hint or ""),
+            "last_visible_date": str(previous_record.get("last_visible_date", "")),
         }
         tmp = path.with_suffix(path.suffix + ".tmp")
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp.replace(path)
     except Exception as exc:
         print(f"[WARNING] Could not update conversation continuity cache: {exc}")
+
+
+def save_conversation_date_hint(
+    cache_path: Optional[str],
+    conversation_key: str,
+    date_hint: str,
+) -> None:
+    """Persist a validated DD/MM/YYYY date without disturbing the side map."""
+    value = str(date_hint or "").strip()
+    if not cache_path or not conversation_key or not re.fullmatch(r"\d{2}/\d{2}/\d{4}", value):
+        return
+    path = Path(cache_path)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data: Dict[str, Any] = {"version": 1, "conversations": {}}
+        if path.exists():
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                data.update(loaded)
+        if not isinstance(data.get("conversations"), dict):
+            data["conversations"] = {}
+        record = dict(data["conversations"].get(conversation_key, {}) or {})
+        record["last_visible_date"] = value
+        data["conversations"][conversation_key] = record
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(path)
+    except Exception as exc:
+        print(f"[WARNING] Could not update conversation date continuity cache: {exc}")
 
 def apply_side_mapping(
     side_csv: str,
@@ -2602,11 +2768,9 @@ def apply_side_mapping(
     seconds added only to preserve bubble order are marked ``True``.
 
     The accepted conversation-level mapping is the default for every row.
-    Individual direction is changed only by an explicit sender cue on that
-    exact row: a leading ``Full Name:`` label or clear self-identification such
-    as ``This is Full Name``.  Direct address (``Hello Alice``, ``Oh Bob``)
-    identifies the recipient and is used during conversation-level validation,
-    but it never flips an individual bubble by itself.
+    Individual direction can be changed by an explicit sender cue on that exact
+    row, or by one unambiguous direct-address cue naming the mapped sender. This
+    changes only the contradictory row, never the fixed mapping of all rows.
     """
     parsed_rows = _side_csv_rows(side_csv)
     pair_names = _unique_names([
@@ -2638,6 +2802,12 @@ def apply_side_mapping(
         if len(explicit_senders) == 1:
             explicit_sender = explicit_senders[0]
             if same_name(explicit_sender, receiver):
+                sender, receiver = receiver, sender
+
+        direct_receivers = _unique_names(list(cue.get("direct_address", []) or []))
+        if len(direct_receivers) == 1:
+            direct_receiver = direct_receivers[0]
+            if same_name(direct_receiver, sender):
                 sender, receiver = receiver, sender
 
         if not sender or not receiver or same_name(sender, receiver):
@@ -3158,6 +3328,10 @@ def _token_norm_for_text_guard(text: str) -> str:
     # Normalize common apostrophe/no-apostrophe forms for the guard only.
     text = re.sub(r"\bim\b", "i am", text)
     text = re.sub(r"\bi'm\b", "i am", text)
+    text = re.sub(r"\bicant\b", "i can not", text)
+    text = re.sub(r"\bijust\b", "i just", text)
+    text = re.sub(r"\biwill\b", "i will", text)
+    text = re.sub(r"\bilove\b", "i love", text)
     text = re.sub(r"\bcant\b", "can not", text)
     text = re.sub(r"\bcan't\b", "can not", text)
     text = re.sub(r"\bdont\b", "do not", text)
@@ -3168,6 +3342,16 @@ def _token_norm_for_text_guard(text: str) -> str:
     text = re.sub(r"\bthat's\b", "that is", text)
     text = re.sub(r"[^a-z0-9]+", " ", text)
     return re.sub(r"\s+", " ", text).strip()
+
+
+def _protected_text_values(text: str) -> List[str]:
+    """Return numeric and identifier evidence a polish row may not change."""
+    pattern = re.compile(
+        r"https?://\S+|www\.\S+|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}|"
+        r"(?<!\w)[€$£]?\d[\d.,:/#-]*",
+        flags=re.IGNORECASE,
+    )
+    return pattern.findall(str(text or ""))
 
 def _text_guard_similarity(a: str, b: str) -> float:
     """Return similarity after guard normalization."""
@@ -3268,33 +3452,58 @@ def choose_text_polished_side_csv(
     if not ref_rows or len(ref_rows) != len(pol_rows):
         return reference_csv
 
+    accepted_rows: List[List[str]] = []
     for ref, pol in zip(ref_rows, pol_rows):
         if ref[0] != pol[0] or ref[1] != pol[1]:
-            return reference_csv
+            accepted_rows.append(ref)
+            continue
         if allowed_times and not _row_has_valid_visible_time(pol, allowed_times):
-            return reference_csv
+            accepted_rows.append(ref)
+            continue
 
         ref_norm = _token_norm_for_text_guard(ref[2])
         pol_norm = _token_norm_for_text_guard(pol[2])
         ref_words = ref_norm.split()
         pol_words = pol_norm.split()
 
+        if _protected_text_values(ref[2]) != _protected_text_values(pol[2]):
+            accepted_rows.append(ref)
+            continue
+
         # For very short rows, require near-identical token content because one
         # changed word can change the whole message.
         if min(len(ref_words), len(pol_words)) <= 3:
             if ref_norm != pol_norm and _text_guard_similarity(ref[2], pol[2]) < 0.92:
-                return reference_csv
-        elif _text_guard_similarity(ref[2], pol[2]) < min_similarity:
-            return reference_csv
+                accepted_rows.append(ref)
+                continue
+        else:
+            # Longer rows can accumulate several OCR character errors while
+            # remaining unambiguously the same visible bubble. Keep short rows
+            # strict, but allow a guarded vision correction for long messages.
+            row_min_similarity = 0.70 if max(len(ref_words), len(pol_words)) >= 12 else min_similarity
+            if _text_guard_similarity(ref[2], pol[2]) < row_min_similarity:
+                accepted_rows.append(ref)
+                continue
 
         # Avoid candidates that drastically lengthen/shorten a row.
         ref_len = max(1, len(str(ref[2]).strip()))
         pol_len = len(str(pol[2]).strip())
         if pol_len < ref_len * 0.55 or pol_len > ref_len * 1.65:
-            return reference_csv
+            accepted_rows.append(ref)
+            continue
 
         if looks_like_noisy_ocr_text(pol[2]) and not looks_like_noisy_ocr_text(ref[2]):
-            return reference_csv
+            accepted_rows.append(ref)
+            continue
+
+        # Accept or reject each row independently. Previously one weak LLM row
+        # rejected every valid text correction in the screenshot.
+        if _text_artifact_penalty(pol[2]) <= _text_artifact_penalty(ref[2]) + 0.25:
+            accepted_rows.append(pol)
+        else:
+            accepted_rows.append(ref)
+
+    row_level_candidate = _write_side_rows(accepted_rows)
 
     ref_candidate_score = score_side_csv_candidate(
         reference_csv,
@@ -3303,7 +3512,7 @@ def choose_text_polished_side_csv(
         bubble_groups=bubble_groups,
     )
     pol_candidate_score = score_side_csv_candidate(
-        polished_csv,
+        row_level_candidate,
         allowed_times=allowed_times,
         expected_bubble_count=expected_bubble_count,
         bubble_groups=bubble_groups,
@@ -3314,12 +3523,12 @@ def choose_text_polished_side_csv(
         return reference_csv
 
     ref_style = _text_style_score(ref_rows)
-    pol_style = _text_style_score(pol_rows)
+    pol_style = _text_style_score(accepted_rows)
 
     # Prefer the polish when it is structurally safe and not stylistically worse.
     # This intentionally allows punctuation/case-only improvements that may raise
     # absolute exact match while leaving normalized/F1 metrics stable.
     if pol_style >= ref_style - 0.25:
-        return polished_csv
+        return row_level_candidate
 
     return reference_csv

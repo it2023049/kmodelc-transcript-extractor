@@ -1850,7 +1850,9 @@ def _is_obvious_wrapped_clause_rotation(original: str, proposed: str) -> bool:
             before_matches[cut - 1].end():before_matches[cut].start()
         ]
         suffix_first = before_matches[cut].group(0)
-        if re.search(r"[.!?…]", boundary) and suffix_first[:1].isupper():
+        # Colons/semicolons can also mark the clause boundary that OCR wrapped.
+        # The exact cyclic-token check above still prevents arbitrary reorderings.
+        if re.search(r"[.!?…:;]", boundary) and suffix_first[:1].isupper():
             return True
     return False
 

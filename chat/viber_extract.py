@@ -18,6 +18,7 @@ from PyPDF2 import PdfReader
 
 Box = Tuple[int, int, int, int]
 ScreenCrop = Tuple[int, int, int, int, np.ndarray]
+VIBER_RIGHT_MIN_X_RATIO = 0.245
 
 from extractor_utils import (
     extract_text_from_report,
@@ -39,6 +40,7 @@ from extractor_utils import (
     looks_like_time,
     looks_like_date_or_time,
     normalize_visible_time_token,
+    split_trailing_visible_time_token,
     parse_ocr_lines,
     extract_allowed_times_from_ocr,
     month_to_number,
@@ -64,7 +66,9 @@ from extractor_utils import (
     apply_side_mapping,
     refine_side_mapping_with_context,
     load_conversation_side_map,
+    load_conversation_date_hint,
     save_conversation_side_map,
+    save_conversation_date_hint,
     write_crop,
     choose_best_screen_side_csv,
     normalize_polished_side_csv_against_reference,
@@ -119,7 +123,7 @@ def position_tag_from_bbox(bbox: Box, crop_w: int, text: str) -> str:
 
     # Viber outgoing bubbles start far enough to the right.
     # Use the left edge, not the center, to avoid misclassifying wide incoming bubbles.
-    if x >= crop_w * 0.25:
+    if x >= crop_w * VIBER_RIGHT_MIN_X_RATIO:
         return "RIGHT"
 
     return "LEFT"
@@ -136,8 +140,11 @@ def estimate_side_from_bubble_color(image: np.ndarray, bbox: Box) -> Optional[st
     h, w = image.shape[:2]
     x, y, bw, bh = bbox
 
-    pad_x = max(18, int(bw * 0.35))
-    pad_y = max(14, int(bh * 1.25))
+    # Sample only the immediate text background. A large crop can include a
+    # neighbouring purple bubble, while a single purple emoji inside a dark
+    # bubble must not determine the side of the entire message.
+    pad_x = max(10, int(bw * 0.08))
+    pad_y = max(8, int(bh * 0.20))
 
     x1 = max(0, x - pad_x)
     y1 = max(0, y - pad_y)
@@ -164,8 +171,11 @@ def estimate_side_from_bubble_color(image: np.ndarray, bbox: Box) -> Optional[st
     )
 
     purple_ratio = float(purple_mask.mean())
+    purple_row_coverage = float((purple_mask.mean(axis=1) >= 0.10).mean())
 
-    if purple_ratio >= 0.065:
+    # A real bubble provides broad, continuous purple background. Isolated
+    # coloured glyphs and emoji have low vertical coverage and are rejected.
+    if purple_ratio >= 0.12 and purple_row_coverage >= 0.35:
         return "RIGHT"
 
     return None
@@ -237,11 +247,26 @@ def refine_ocr_block_positions(blocks: List[Dict], crop_w: int) -> List[Dict]:
         lines.append(current)
 
     for line in lines:
+        # Purple bubble colour is stronger evidence than left-edge geometry.
+        # Preserve it when OCR splits one visual line into several fragments.
+        color_sides = {
+            b.get("color_side") for b in line
+            if b.get("color_side") in {"LEFT", "RIGHT"}
+        }
+        if len(color_sides) == 1:
+            fixed_side = next(iter(color_sides))
+            for b in line:
+                b["pos"] = fixed_side
+            continue
+
         min_x = min(b["x"] for b in line)
 
         # If a visual line starts on the left, the whole line belongs to a LEFT bubble.
         # A real right-side bubble should not have any text starting this far left.
-        if min_x < crop_w * 0.22:
+        # Keep this threshold consistent with position_tag_from_bbox(). The
+        # previous inconsistent thresholds made wrapped lines near the boundary flip
+        # sides inside one wide bubble, especially in dark Viber themes.
+        if min_x < crop_w * VIBER_RIGHT_MIN_X_RATIO:
             for b in line:
                 b["pos"] = "LEFT"
         else:
@@ -286,7 +311,10 @@ def extract_ocr_blocks(reader, crop: np.ndarray, screen_index: int) -> str:
             continue
 
         x, y, bw, bh = polygon_to_xywh(poly)
-        pos = position_tag_from_color_or_bbox(upscaled, (x, y, bw, bh), w, text)
+        color_side = None if looks_like_date_or_time(text) else estimate_side_from_bubble_color(
+            upscaled, (x, y, bw, bh)
+        )
+        pos = color_side or position_tag_from_bbox((x, y, bw, bh), w, text)
 
         blocks.append({
             "pos": pos,
@@ -295,6 +323,7 @@ def extract_ocr_blocks(reader, crop: np.ndarray, screen_index: int) -> str:
             "w": bw,
             "h": bh,
             "conf": conf,
+            "color_side": color_side,
             "text": text,
         })
 
@@ -337,20 +366,32 @@ def extract_visible_date_from_ocr(
     for row in rows:
         text = row["text"].strip()
 
+        # Month-first layouts: "April 07" / "April 7, 2026".
         m = re.search(
             r"\b(Jan|January|Feb|February|Mar|March|Apr|April|May|Jun|June|Jul|July|Aug|August|Sep|Sept|September|Oct|October|Nov|November|Dec|December)\s+(\d{1,2})(?:,?\s+(20\d{2}))?\b",
             text,
             flags=re.I,
         )
-        if not m:
-            continue
+        if m:
+            month = month_to_number(m.group(1))
+            day = int(m.group(2))
+            year = int(m.group(3)) if m.group(3) else default_year
+            if month and 1 <= day <= 31:
+                return f"{day:02d}/{month:02d}/{year}"
 
-        month = month_to_number(m.group(1))
-        day = int(m.group(2))
-        year = int(m.group(3)) if m.group(3) else default_year
-
-        if month:
-            return f"{day:02d}/{month:02d}/{year}"
+        # Day-first layouts are also common in mobile Viber screenshots:
+        # "07 April" / "7 Apr 2026".
+        m = re.search(
+            r"\b(\d{1,2})\s+(Jan|January|Feb|February|Mar|March|Apr|April|May|Jun|June|Jul|July|Aug|August|Sep|Sept|September|Oct|October|Nov|November|Dec|December)(?:,?\s+(20\d{2}))?\b",
+            text,
+            flags=re.I,
+        )
+        if m:
+            day = int(m.group(1))
+            month = month_to_number(m.group(2))
+            year = int(m.group(3)) if m.group(3) else default_year
+            if month and 1 <= day <= 31:
+                return f"{day:02d}/{month:02d}/{year}"
 
     if previous_date_hint:
         return previous_date_hint
@@ -417,9 +458,126 @@ def find_header_match(ocr_data: str, actors: Dict) -> str:
 
     return sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[0][0]
 
+def find_report_grounded_header_match(ocr_data: str, report_text: str) -> str:
+    """Find an exact human name in both the Viber header and case report.
+
+    This fallback is intentionally conservative. It is used when structured
+    actor parsing missed a participant and accepts only a complete two-to-five
+    token title-cased header row that also occurs verbatim in the report.
+    """
+    if not report_text:
+        return ""
+
+    blocked_words = {
+        "active", "april", "august", "december", "february", "friday",
+        "january", "july", "june", "march", "monday", "november",
+        "october", "saturday", "september", "sunday", "thursday",
+        "tuesday", "viber", "wednesday",
+    }
+    candidates: List[str] = []
+
+    for row in parse_ocr_lines(ocr_data):
+        try:
+            y = int(row.get("y", "9999"))
+        except (TypeError, ValueError):
+            continue
+        if y > 350:
+            continue
+
+        candidate = clean_name(row.get("text", "")).strip(" ,;:()[]{}\"'")
+        tokens = candidate.split()
+        if not 2 <= len(tokens) <= 5:
+            continue
+        if any(token.casefold().strip(".,") in blocked_words for token in tokens):
+            continue
+        if not re.fullmatch(
+            r"[A-Z][A-Za-z'’.-]+(?:\s+[A-Z][A-Za-z'’().-]+){1,4}",
+            candidate,
+        ):
+            continue
+
+        pattern = r"(?<![A-Za-z])" + r"\s+".join(
+            re.escape(token) for token in tokens
+        ) + r"(?![A-Za-z])"
+        match = re.search(pattern, report_text, flags=re.I)
+        if match:
+            candidates.append(clean_name(match.group(0)))
+
+    if not candidates:
+        return ""
+    return sorted(candidates, key=lambda value: (-len(value.split()), -len(value)))[0]
+
+def participant_initials(name: str) -> str:
+    """Return initials for a canonical participant name."""
+    words = re.findall(r"[A-Za-z]+", clean_name(name))
+    return "".join(word[0].upper() for word in words if word)
+
+def refine_side_map_with_avatar_initials(
+    side_map: Dict[str, str],
+    actors: Dict,
+    ocr_data: str,
+) -> Dict[str, str]:
+    """Use a uniquely report-grounded Viber avatar initial as side evidence.
+
+    Only a standalone 2--4 letter uppercase token near the far-left avatar
+    gutter is considered. If it uniquely identifies the participant currently
+    assigned to the opposite side, the two-person mapping is swapped. No new
+    identity is invented and ordinary message acronyms are ignored.
+    """
+    mapping = {
+        "LEFT": clean_name(side_map.get("LEFT", "")),
+        "RIGHT": clean_name(side_map.get("RIGHT", "")),
+    }
+    if not mapping["LEFT"] or not mapping["RIGHT"]:
+        return side_map
+
+    known_names: List[str] = []
+    for participant in (actors or {}).get("participants", []) or []:
+        if isinstance(participant, dict):
+            name = clean_name(participant.get("name", ""))
+            if name and not any(same_name(name, seen) for seen in known_names):
+                known_names.append(name)
+    for name in mapping.values():
+        if name and not any(same_name(name, seen) for seen in known_names):
+            known_names.append(name)
+
+    initials_to_names: Dict[str, List[str]] = {}
+    for name in known_names:
+        initials = participant_initials(name)
+        if 2 <= len(initials) <= 4:
+            initials_to_names.setdefault(initials, []).append(name)
+
+    for row in parse_ocr_lines(ocr_data):
+        token = str(row.get("text", "")).strip()
+        try:
+            x = int(row.get("x", "9999"))
+            y = int(row.get("y", "0"))
+        except (TypeError, ValueError):
+            continue
+        if not re.fullmatch(r"[A-Z]{2,4}", token) or x > 160 or y < 350:
+            continue
+        matches = initials_to_names.get(token, [])
+        if len(matches) != 1:
+            continue
+        avatar_name = matches[0]
+        avatar_side = str(row.get("pos", "")).upper()
+        if avatar_side not in {"LEFT", "RIGHT"}:
+            continue
+        other_side = "RIGHT" if avatar_side == "LEFT" else "LEFT"
+        if same_name(mapping[other_side], avatar_name) and not same_name(
+            mapping[avatar_side], avatar_name
+        ):
+            return {
+                avatar_side: mapping[other_side],
+                other_side: mapping[avatar_side],
+            }
+
+    return mapping
+
 def deterministic_viber_side_map(
     actors: Dict,
-    ocr_data: str
+    ocr_data: str,
+    report_text: str = "",
 ) -> Optional[Dict[str, str]]:
     """Infers Viber LEFT/RIGHT names from header and contact evidence."""
     # Notes:
@@ -445,6 +603,8 @@ def deterministic_viber_side_map(
     # 1. Header evidence wins
     # -------------------------
     header_name = find_header_match(ocr_data, actors)
+    if not header_name:
+        header_name = find_report_grounded_header_match(ocr_data, report_text)
 
     if header_name and victim and not same_name(header_name, victim):
         return {
@@ -552,10 +712,14 @@ def infer_side_mapping(
     model: str
 ) -> Dict[str, str]:
     """Returns the final fixed LEFT/RIGHT speaker mapping."""
-    deterministic = deterministic_viber_side_map(actors, ocr_data)
+    deterministic = deterministic_viber_side_map(actors, ocr_data, report_text)
 
     if deterministic:
-        return deterministic
+        return refine_side_map_with_avatar_initials(
+            deterministic,
+            actors,
+            ocr_data,
+        )
 
     prompt = build_side_map_prompt(
         report_text=report_text,
@@ -577,10 +741,14 @@ def infer_side_mapping(
     if not left or not right or normalize_name(left) == normalize_name(right):
         raise ValueError(f"Invalid side map:\n{data}")
 
-    return {
-        "LEFT": left,
-        "RIGHT": right,
-    }
+    return refine_side_map_with_avatar_initials(
+        {
+            "LEFT": left,
+            "RIGHT": right,
+        },
+        actors,
+        ocr_data,
+    )
 
 # ============================================================
 # SCREEN EXTRACTION PROMPTS
@@ -784,6 +952,21 @@ def is_ui_message(message: str) -> bool:
     if any(part in low for part in ui_substrings):
         return True
 
+    # OCR often splits or damages the standard Viber privacy banner. Match its
+    # stable concepts rather than requiring one exact sentence.
+    ui_norm = re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", low)).strip()
+    ui_words = set(ui_norm.split())
+    if {"messages", "chat", "private"}.issubset(ui_words):
+        return True
+    if {"viber", "end", "to", "encryption"}.issubset(ui_words):
+        return True
+    if {"protected", "end", "to"}.issubset(ui_words):
+        return True
+    if "encryption" in ui_words and ({"viber", "protected"} & ui_words):
+        return True
+    if re.fullmatch(r"(?:protec?ted|cted)\s+by(?:\s+(?:viber|more))?", ui_norm):
+        return True
+
     # Bottom icon OCR noise.
     if re.fullmatch(r"(gif|gıf|g1f)", low, flags=re.IGNORECASE):
         return True
@@ -801,15 +984,17 @@ def clean_message_text(message: str) -> str:
     """Apply minimal, generic cleanup without semantic rewriting."""
     return conservative_clean_message_text(message)
 
-def build_ocr_bubble_groups(screen_ocr: str) -> List[Dict[str, str]]:
-    """Groups OCR blocks into timestamped bubble hints."""
-    # Notes:
-    # The LLM may sometimes assign LEFT/RIGHT incorrectly. For Viber screenshots,
-    # the OCR geometry is more reliable for side than the LLM. Each group ends at
-    # the visible bubble timestamp that follows the bubble text.
-    #
-    # Returns groups like:
-    # {"time": "11:02", "side": "RIGHT", "text": "..."}
+def build_ocr_bubble_groups(
+    screen_ocr: str,
+    allow_top_content: bool = False,
+) -> List[Dict[str, str]]:
+    """Group positioned OCR into one hint per visible Viber bubble.
+
+    The implementation handles three common OCR failures generically:
+    tiny time glyphs (``Ji00`` -> ``11:00``), a timestamp attached to the last
+    message line, and fragments from one visual line returned in x/y order that
+    would otherwise read backwards.
+    """
     rows = parse_ocr_lines(screen_ocr)
 
     def to_int(value: str, default: int = 0) -> int:
@@ -819,14 +1004,79 @@ def build_ocr_bubble_groups(screen_ocr: str) -> List[Dict[str, str]]:
         except Exception:
             return default
 
-    rows = sorted(
-        rows,
-        key=lambda r: (
-            to_int(r.get("y", "0")),
+    # Cluster blocks that overlap vertically, then read each line left-to-right.
+    # This repairs cases such as x=733/y=849 "ready:" being emitted before
+    # x=256/y=859 "Your account is now".
+    raw_order = sorted(rows, key=lambda r: (
+        to_int(r.get("y", "0")),
+        to_int(r.get("x", "0")),
+        to_int(r.get("block", "0")),
+    ))
+    visual_lines: List[List[Dict[str, str]]] = []
+    for row in raw_order:
+        top = to_int(row.get("y", "0"))
+        bottom = top + max(1, to_int(row.get("h", "1"), 1))
+        best_line = None
+        best_overlap = 0
+        for line in visual_lines[-3:]:
+            line_top = min(to_int(item.get("y", "0")) for item in line)
+            line_bottom = max(
+                to_int(item.get("y", "0")) + max(1, to_int(item.get("h", "1"), 1))
+                for item in line
+            )
+            overlap = min(bottom, line_bottom) - max(top, line_top)
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_line = line
+        row_h = max(1, bottom - top)
+        if best_line is not None and best_overlap >= max(8, int(row_h * 0.25)):
+            best_line.append(row)
+        else:
+            visual_lines.append([row])
+    visual_lines.sort(key=lambda line: min(to_int(item.get("y", "0")) for item in line))
+    rows = [
+        item
+        for line in visual_lines
+        for item in sorted(line, key=lambda r: (
             to_int(r.get("x", "0")),
             to_int(r.get("block", "0")),
+        ))
+    ]
+
+    # Mark all vertically contiguous fragments of the standard privacy banner.
+    # OCR may return its last word (for example "more") as a separate block
+    # that is not identifiable as UI when considered in isolation.
+    privacy_banner_row_ids: Set[int] = set()
+    vertical_rows = sorted(rows, key=lambda r: (
+        to_int(r.get("y", "0")),
+        to_int(r.get("x", "0")),
+    ))
+    for index, row in enumerate(vertical_rows):
+        anchor_norm = re.sub(
+            r"\s+",
+            " ",
+            re.sub(r"[^a-z0-9]+", " ", row.get("text", "").casefold()),
+        ).strip()
+        anchor_words = set(anchor_norm.split())
+        if not {"messages", "chat", "private"}.issubset(anchor_words):
+            continue
+
+        privacy_banner_row_ids.add(id(row))
+        previous_bottom = to_int(row.get("y", "0")) + max(
+            1, to_int(row.get("h", "1"), 1)
         )
-    )
+        previous_height = max(1, to_int(row.get("h", "1"), 1))
+        for following in vertical_rows[index + 1:]:
+            if looks_like_date_or_time(following.get("text", "")):
+                break
+            following_y = to_int(following.get("y", "0"))
+            following_height = max(1, to_int(following.get("h", "1"), 1))
+            gap = following_y - previous_bottom
+            if gap > max(100, int(max(previous_height, following_height) * 0.80)):
+                break
+            privacy_banner_row_ids.add(id(following))
+            previous_bottom = max(previous_bottom, following_y + following_height)
+            previous_height = following_height
 
     date_y = None
     for row in rows:
@@ -836,54 +1086,121 @@ def build_ocr_bubble_groups(screen_ocr: str) -> List[Dict[str, str]]:
                 date_y = y if date_y is None else max(date_y, y)
 
     current: List[Dict[str, str]] = []
+    pending_bubbles: List[List[Dict[str, str]]] = []
     groups: List[Dict[str, str]] = []
+
+    continuation_endings = {
+        "a", "an", "and", "as", "at", "because", "but", "by", "for",
+        "from", "in", "into", "is", "my", "of", "on", "or", "our",
+        "that", "the", "their", "to", "was", "were", "which", "with",
+        "would", "your",
+    }
+
+    def should_split_before(row: Dict[str, str]) -> bool:
+        if not current:
+            return False
+        previous = current[-1]
+        prev_side = previous.get("pos", "").upper()
+        next_side = row.get("pos", "").upper()
+        prev_bottom = to_int(previous.get("y", "0")) + max(1, to_int(previous.get("h", "1"), 1))
+        gap = to_int(row.get("y", "0")) - prev_bottom
+        height = max(
+            to_int(previous.get("h", "1"), 1),
+            to_int(row.get("h", "1"), 1),
+        )
+        # Wrapped lines in one bubble can receive different side labels when a
+        # wide dark bubble crosses the geometric boundary. Vertical proximity
+        # is stronger evidence than that per-line label. A visible timestamp
+        # still emits the preceding bubble before this rule is reached.
+        if gap <= max(45, int(height * 0.70)):
+            return False
+        if prev_side in {"LEFT", "RIGHT"} and next_side in {"LEFT", "RIGHT"} and prev_side != next_side:
+            return True
+        previous_text = " ".join(item.get("text", "").strip() for item in current).strip()
+        words = re.findall(r"[A-Za-z']+", previous_text.casefold())
+        last_word = words[-1] if words else ""
+        if last_word in continuation_endings or re.search(r"[-,/;(]$", previous_text):
+            return False
+        # A very large gap is a bubble boundary. A shorter gap is accepted for
+        # compact complete messages such as "You need to act quickly".
+        return gap >= max(58, int(height * 0.52)) or len(words) <= 8
+
+    def emit(timestamp: str) -> None:
+        bubble_sets = list(pending_bubbles)
+        if current:
+            bubble_sets.append(list(current))
+        for bubble_rows in bubble_sets:
+            raw_group_text = " ".join(
+                item.get("text", "").strip()
+                for item in bubble_rows
+                if item.get("text", "").strip()
+            )
+            # A privacy-banner sentence may be fragmented into individually
+            # meaningless OCR tokens. Evaluate the reconstructed group as well
+            # as each individual block before accepting it as a chat bubble.
+            if is_ui_message(raw_group_text):
+                continue
+            usable = [
+                r for r in bubble_rows
+                if r.get("pos", "").upper() in {"LEFT", "RIGHT"}
+                and not is_ui_message(r.get("text", ""))
+            ]
+            if not usable:
+                continue
+            side_scores = {"LEFT": 0, "RIGHT": 0}
+            for bubble_row in usable:
+                side = bubble_row.get("pos", "").upper()
+                side_scores[side] += max(1, len(bubble_row.get("text", "").strip()))
+            side = "LEFT" if side_scores["LEFT"] >= side_scores["RIGHT"] else "RIGHT"
+            group_text = " ".join(
+                bubble_row.get("text", "").strip()
+                for bubble_row in usable
+                if bubble_row.get("text", "").strip()
+            )
+            if group_text:
+                groups.append({
+                    "time": timestamp,
+                    "side": side,
+                    "text": group_text,
+                    "order": len(groups),
+                })
 
     for row in rows:
         text = row.get("text", "").strip()
         pos = row.get("pos", "").upper()
         y = to_int(row.get("y", "0"), 0)
 
+        if id(row) in privacy_banner_row_ids:
+            continue
+
         # Ignore status/header area before the date separator.
         if date_y is not None and y <= date_y:
             continue
-        if date_y is None and y < 250:
+        # A continuation screenshot may start in the middle of a bubble and
+        # legitimately contain message text above y=250. Its date is inherited
+        # only from the same evidence-folder conversation.
+        if date_y is None and y < 250 and not allow_top_content:
             continue
 
-        visible_time = normalize_visible_time_token(text)
+        message_prefix, visible_time = split_trailing_visible_time_token(text)
 
         if visible_time:
-            bubble_rows = [
-                r for r in current
-                if r.get("pos", "").upper() in {"LEFT", "RIGHT"}
-                and not looks_like_date_or_time(r.get("text", ""))
-                and not is_ui_message(r.get("text", ""))
-            ]
-
-            if bubble_rows:
-                side_scores = {"LEFT": 0, "RIGHT": 0}
-
-                for br in bubble_rows:
-                    side = br.get("pos", "").upper()
-                    if side in side_scores:
-                        # Character-weighted voting is more stable than row count
-                        # when OCR splits one line into multiple fragments.
-                        side_scores[side] += max(1, len(br.get("text", "").strip()))
-
-                side = "LEFT" if side_scores["LEFT"] >= side_scores["RIGHT"] else "RIGHT"
-
-                group_text = " ".join(br.get("text", "").strip() for br in bubble_rows if br.get("text", "").strip())
-
-                groups.append({
-                    "time": visible_time,
-                    "side": side,
-                    "text": group_text,
-                    "order": len(groups),
-                })
-
+            if message_prefix and pos in {"LEFT", "RIGHT"} and not is_ui_message(message_prefix):
+                prefix_row = dict(row)
+                prefix_row["text"] = message_prefix
+                if should_split_before(prefix_row):
+                    pending_bubbles.append(list(current))
+                    current = []
+                current.append(prefix_row)
+            emit(visible_time)
             current = []
+            pending_bubbles = []
             continue
 
         if pos in {"LEFT", "RIGHT"} and text and not is_ui_message(text) and not looks_like_date_or_time(text):
+            if should_split_before(row):
+                pending_bubbles.append(list(current))
+                current = []
             current.append(row)
 
     return groups
@@ -1397,8 +1714,14 @@ def process_viber_image(
     reader = easyocr.Reader(langs, gpu=use_gpu)
 
     # Extract participant context from the report for side mapping.
-    # Keep this internal: empty/partial actor JSON is not printed to the run log.
+    # Keep the full structure out of the normal run log, but preserve it in an
+    # explicitly requested debug folder so actor-parser failures are auditable.
     actors = infer_report_actors(report_text, model)
+    if dump_side_map:
+        write_debug_text(
+            output_debug_dir / "report_actors.json",
+            json.dumps(actors, ensure_ascii=False, indent=2),
+        )
 
     # Reuse the last validated mapping from the same evidence folder as a soft
     # continuity prior. Explicit cues in the current screenshot always win.
@@ -1451,9 +1774,16 @@ def process_viber_image(
             json.dumps(side_map, ensure_ascii=False, indent=2),
         )
 
-    # Second pass: ask the VLM to extract each screen as Side CSV.
+    # Second pass: ask the VLM to extract each screen as Side CSV. If this file
+    # is a continuation screenshot with no visible date separator, reuse only
+    # the last validated date from the same platform/folder conversation.
     side_csv_parts = []
-    previous_date_hint = ""
+    previous_date_hint = load_conversation_date_hint(
+        conversation_state_cache,
+        conversation_key,
+    )
+    if previous_date_hint:
+        print(f"-> [DATE] Previous folder date: {previous_date_hint}")
 
     for idx, screen_ocr in enumerate(all_screen_ocr, start=1):
         print(f"-> [LLM] Extracting screen #{idx} as Side CSV...")
@@ -1466,7 +1796,10 @@ def process_viber_image(
 
         # Limit accepted times to times actually visible in this screen.
         allowed_times = extract_allowed_times_from_ocr(screen_ocr)
-        ocr_bubble_groups = build_ocr_bubble_groups(screen_ocr)
+        ocr_bubble_groups = build_ocr_bubble_groups(
+            screen_ocr,
+            allow_top_content=bool(previous_date_hint),
+        )
         bubble_hints = build_viber_bubble_hints(ocr_bubble_groups)
 
         if dump_draft:
@@ -1571,6 +1904,7 @@ def process_viber_image(
             repaired_norm = ""
 
         # Keep the repaired CSV only if it stays within a sane row count.
+        chosen_source = "draft_norm"
         if repaired_norm:
             chosen = choose_best_screen_side_csv(
                 draft_norm=draft_norm,
@@ -1580,6 +1914,8 @@ def process_viber_image(
                 bubble_groups=ocr_bubble_groups,
                 enable_additive=False,
             )
+            if chosen == repaired_norm:
+                chosen_source = "repaired_norm"
         else:
             chosen = draft_norm
 
@@ -1617,34 +1953,45 @@ def process_viber_image(
             )
 
             if polished_norm:
-                chosen = choose_text_polished_side_csv(
+                polished_choice = choose_text_polished_side_csv(
                     reference_csv=chosen,
                     polished_csv=polished_norm,
                     allowed_times=allowed_times,
                     expected_bubble_count=expected_bubbles,
                     bubble_groups=ocr_bubble_groups,
                 )
+                if polished_choice != chosen:
+                    chosen_source += "+row_polish"
+                chosen = polished_choice
 
         # Final timestamp policy for Viber: keep visible per-bubble minutes and
         # add zero seconds to every row.
         chosen = ensure_zero_seconds_side_csv(chosen)
 
         if dump_draft:
-            chosen_source = "repaired_norm" if chosen == repaired_norm else "draft_norm"
             write_debug_text(output_debug_dir / f"screen_{idx:02d}_chosen_source.txt", chosen_source)
             write_debug_text(output_debug_dir / f"screen_{idx:02d}_side.csv", chosen)
 
         last_date = extract_last_date_from_side_csv(chosen)
         if last_date:
             previous_date_hint = last_date
+            save_conversation_date_hint(
+                conversation_state_cache,
+                conversation_key,
+                previous_date_hint,
+            )
 
         side_csv_parts.append(chosen)
 
     # Merge all screen-level CSV parts before applying real names.
     merged_side_csv = merge_side_csvs(side_csv_parts)
 
-    # Generic cleanup only: adjacent near-duplicates and safe continuation fragments.
-    merged_side_csv = postprocess_side_csv_rows(merged_side_csv)
+    # Bubble grouping has already decided row boundaries. Do not merge two
+    # distinct Viber bubbles merely because their sender and minute match.
+    merged_side_csv = postprocess_side_csv_rows(
+        merged_side_csv,
+        merge_continuations=False,
+    )
 
     if dump_draft:
         write_debug_text(output_debug_dir / "merged_side.csv", merged_side_csv)
@@ -1663,6 +2010,13 @@ def process_viber_image(
         model=model,
         prior_side_map=prior_side_map,
         evidence_hint=image_path,
+    )
+    # Preserve uniquely matched avatar-initial evidence even if the broader
+    # context pass proposed the opposite visual orientation.
+    side_map = refine_side_map_with_avatar_initials(
+        side_map,
+        actors,
+        full_ocr,
     )
     if side_map != provisional_side_map:
         print(
