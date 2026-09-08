@@ -1,286 +1,172 @@
-# KModelC Transcript Extractor
+# KModelC-Griphia
 
-A Python toolkit for extracting communication evidence from chat screenshots,
-email screenshots, voice messages, and recorded calls into one normalized,
-chronologically ordered CSV transcript.
+A Python toolkit for extracting communication evidence from Facebook Messenger and Viber screenshots and converting the results into one normalized CSV transcript.
 
-The pipeline combines OCR, vision-language models, MOSS transcription and
-speaker diarization, and report-grounded participant attribution. It is designed
-for research, evaluation, and evidence-review workflows in which the original
-source material remains available for human verification.
+KModelC-Griphia is **chat-only**. It processes supported chat screenshots and deliberately ignores audio/video evidence. Email screenshots and other unsupported images are classified as non-chat/unsupported and skipped.
 
 ## Features
 
-- Facebook Messenger screenshot and collage extraction
-- Viber screenshot and collage extraction
-- email screenshot extraction
-- voice-message and recorded-call transcription
-- speaker-change timestamps from MOSS
-- report-grounded sender and receiver attribution
-- ZIP, folder, file, and glob input
+- Facebook Messenger screenshot extraction
+- Viber screenshot extraction
+- screenshot-collage handling
+- ZIP package input
+- folder input
+- single-image extraction
 - recursive evidence discovery
 - automatic case-report discovery
-- vision-assisted evidence classification
-- skipping profiles, receipts, dashboards, unrelated documents, and other
-  non-conversation images
-- strict post-chat LLM cleanup limited to the `Message` field
-- contextual date selection for each audio file
-- chronological merge into one forensic CSV
-- optional intermediate outputs, debug artifacts, and JSON manifests
+- automatic Facebook/Viber routing
+- skipping unsupported, email, non-chat, and unknown images
+- case-aware sender/receiver attribution
+- conversation-level `LEFT`/`RIGHT` continuity
+- chronological merge into one CSV
+- strict post-extraction LLM cleanup limited to the `Message` field
+- deterministic validation of every proposed LLM edit
+- optional debug and intermediate outputs
 
-The public output schema is:
+The final transcript schema is:
 
 ```csv
 "Timestamp","Estimated_Timestamp","Sender","Receiver","Message"
 "DD/MM/YYYY HH:MM:SS","False","Sender Name","Receiver Name","Message text"
 ```
 
-## Processing Order
+## Scope
 
-The batch pipeline follows a fixed order:
+KModelC-Griphia processes **chat screenshots only**.
 
-1. classify and extract chat screenshots
-2. write the raw chat-only CSV
-3. run strict `Message`-only cleanup
-4. write the polished chat-only CSV
-5. transcribe and attribute audio evidence
-6. extract deferred email screenshots
-7. merge and sort all retained rows chronologically
-
-The post-chat cleanup is not allowed to change timestamps, sender/receiver
-fields, row order, or row count. It may only correct obvious OCR word-order,
-spacing, capitalization, punctuation, or identifier-spacing errors inside a
-message.
-
-## Supported Evidence
-
-### Chat screenshots
+Supported communication platforms:
 
 - Facebook Messenger
 - Viber
-- individual screenshots
-- multi-screen collages
 
-### Email screenshots
+Not processed:
 
-- open email messages
-- webmail views
-- rendered email content with visible sender, recipient, date, and body evidence
-
-### Audio and video
-
-Audio and video formats accepted by the installed MOSS and media dependencies
-can be processed as:
-
-- single-speaker voice messages
-- two-party calls
-- multi-party calls
-- reconstructed conversation recordings
-
-### Automatically skipped images
-
-Examples include:
-
-- standalone contact or profile screens without message bubbles
+- audio recordings
+- video recordings
+- email screenshots
 - payment receipts
-- account dashboards
-- transaction confirmations
+- banking screenshots
+- trading dashboards
 - identity documents
-- unrelated photographs
-- settings screens
-- unsupported or unrecognized evidence
+- unrelated images
 
-Skipped non-conversation images are not treated as extraction failures.
+Audio/video files may exist inside an evidence ZIP, but the pipeline intentionally ignores them.
 
 ## Project Structure
 
+KModelC-Griphia uses a flat script layout:
+
 ```text
-kmodelc-transcript-extractor/
+KModelC-Griphia/
 ├── README.md
-├── chat/
-│   ├── mass_extract.py
-│   ├── facebook_extract.py
-│   ├── viber_extract.py
-│   └── extractor_utils.py
-├── speech/
-│   ├── audio_diarize.py
-│   └── audio_utils.py
-└── email/
-    └── email_extract.py
+├── extractor_utils.py
+├── facebook_extract.py
+├── viber_extract.py
+└── mass_extract.py
 ```
 
-Treat these seven Python files as one matching release set. Do not combine files
-from different releases of the pipeline.
+These four Python files form one matching code package:
+
+```text
+extractor_utils.py
+facebook_extract.py
+viber_extract.py
+mass_extract.py
+```
+
+Keep the four matching Python files together; mixing files from different code packages can break internal arguments and shared behavior.
 
 ## Components
 
-### `chat/mass_extract.py`
+### `extractor_utils.py`
 
-The integrated batch orchestrator. It:
+Shared functionality for:
 
-- discovers or accepts a case report
-- extracts ZIP packages safely
-- discovers supported evidence recursively
-- classifies screenshots
-- runs the appropriate chat or email extractor
-- preserves conversation-level chat mapping continuity
-- optionally retains raw and polished chat-only CSV snapshots
-- writes raw and polished chat-only CSV files
-- runs the audio pipeline once for all discovered recordings
-- infers an evidence-bounded date independently for each audio file
-- merges retained rows into one chronological transcript
-- reports partial failure when a required stage does not complete
-
-### `chat/facebook_extract.py`
-
-Processes one Facebook Messenger screenshot or collage. It extracts anonymous
-left/right message rows, infers a participant mapping, validates that mapping
-against the report and conversation evidence, and writes the common CSV schema.
-
-### `chat/viber_extract.py`
-
-Processes one Viber screenshot or collage using the same evidence-constrained
-attribution strategy while accounting for Viber-specific layout and timestamp
-behavior.
-
-### `chat/extractor_utils.py`
-
-Shared chat functionality, including:
-
-- report parsing and participant discovery
-- screenshot and collage splitting
-- OCR block parsing
+- case-report parsing
+- participant extraction
+- conservative participant validation
+- screenshot/collage splitting
+- OCR parsing
 - timestamp normalization
-- bubble-side analysis
+- bubble-side handling
 - message cleanup
 - duplicate detection
-- participant-pair scoring
+- sender/receiver evidence scoring
 - conversation-level side-map validation
-- CSV generation
+- final CSV generation
 
-### `speech/audio_diarize.py`
+### `facebook_extract.py`
 
-Runs a two-stage audio pipeline:
+Processes one Facebook Messenger screenshot or collage.
 
-1. MOSS transcription and anonymous speaker-change mapping
-2. constrained sender/receiver attribution using the case report, transcript,
-   filename provenance, interaction graph, and conversation context
+The extractor:
 
-The canonical MOSS transcript format is parsed into real start/end offsets.
-Outputs without complete, monotonic timestamps are retried with the official
-timestamped-diarization prompt and are not silently replaced with invented
-offsets.
+1. reads the case report
+2. splits collages when necessary
+3. extracts OCR and visual evidence
+4. produces anonymous `LEFT`/`RIGHT` message rows
+5. infers a provisional participant mapping
+6. validates the mapping against report and conversation evidence
+7. writes the final sender/receiver CSV
 
-### `speech/audio_utils.py`
+### `viber_extract.py`
 
-Shared audio helpers for:
+Processes one Viber screenshot or collage using the same general attribution strategy while accounting for Viber-specific layout and timestamp behavior.
 
-- media discovery
-- speaker and conversation data structures
-- case-report participant parsing
-- receiver inference
-- turn merging
-- CSV, TXT, and JSON output
+### `mass_extract.py`
 
-### `email/email_extract.py`
+Batch orchestrator for evidence ZIPs, folders, and groups of images.
 
-Processes one email screenshot and writes one row in the common transcript
-schema. It uses visible screenshot evidence for the message body and uses the
-case report only to constrain and canonicalize supported identities and dates.
+It:
 
-## Sender and Receiver Attribution
+- extracts ZIP packages safely
+- discovers candidate screenshots recursively
+- discovers or accepts a case report
+- classifies screenshots as Facebook, Viber, or unsupported
+- runs the appropriate extractor
+- preserves conversation-level mapping continuity within an evidence folder
+- merges extracted rows chronologically
+- runs a guarded LLM cleanup after all chat screenshots have been extracted
+- changes only validated `Message` values
+- writes one final CSV
 
-### Chat attribution
+## Attribution Strategy
 
-Chat attribution is performed at conversation level rather than by freely
-guessing an identity for every row.
+Sender and receiver attribution is performed at conversation level rather than by independently guessing a participant for every row.
 
-The pipeline derives a provisional `LEFT`/`RIGHT` mapping using evidence such as:
+The pipeline first derives a provisional `LEFT`/`RIGHT` mapping using evidence such as:
 
 - platform layout
-- bubble geometry and color
-- visible header or contact text
-- phone and account evidence
+- bubble geometry
+- bubble color where available
+- visible header/contact text
+- phone/contact evidence
 - case-report participants
 - extracted conversation content
-- continuity from earlier screenshots in the same evidence folder
+- continuity from previous screenshots in the same evidence folder
 
-Strong identity cues include:
+The mapping is then validated against deterministic evidence.
+
+Strong cues include:
 
 - an explicit leading speaker label
 - self-identification such as `This is Alex Example`
 - direct address such as `Hello Jordan`
-- exact visible contact/header evidence
-- a consistent two-person conversation structure
+- exact contact/header evidence
+- consistent two-person conversation structure
 
-A third-party mention is not treated as automatic speaker evidence. For example:
+Third-party mentions are not treated as automatic speaker evidence.
+
+For example:
 
 ```text
 I spoke with Alex.
 Jordan told me about the payment.
 ```
 
-does not imply that Alex or Jordan sent the current message.
+does not imply that Alex or Jordan is the sender of the current message.
 
-Participant fields are restricted to individual report-grounded names. Document
-headings, offence labels, section titles, roles, channels, and explanatory
-phrases are not valid sender or receiver values.
-
-### Audio attribution
-
-Audio attribution combines:
-
-- anonymous MOSS speaker labels
-- explicit self-identification
-- direct address
-- exact report-grounded participant names
-- filename provenance
-- report timeline and interaction evidence
-- constrained LLM attribution
-- deterministic post-validation
-
-For a single-speaker voice message, the audible speaker may be identified from
-self-identification or filename provenance. The non-audible receiver is inferred
-conservatively from direct address and interaction evidence. If the evidence is
-insufficient, the attribution remains unresolved rather than inventing a name.
-
-## Timestamp Semantics
-
-### `Estimated_Timestamp`
-
-- `False`: the timestamp is directly supported by the source screenshot.
-- `True`: some or all timestamp components were inferred or synthesized from
-  bounded evidence.
-
-### Facebook Messenger
-
-Facebook screenshots may expose a screen-level time rather than one complete
-timestamp per bubble. The extractor preserves the visible anchor and may add
-deterministic seconds to retain bubble order.
-
-### Viber
-
-Visible Viber times are normalized to:
-
-```text
-DD/MM/YYYY HH:MM:SS
-```
-
-When seconds are not visible, `:00` is added.
-
-### Email
-
-Email rows use the supported email date at `00:00:00` and are marked as
-estimated.
-
-### Audio
-
-Each audio file is evaluated independently against dates observed in the report
-and extracted chats. The selected date anchors the complete recording, so every
-turn in one conversation keeps the same calendar date.
-
-Real MOSS speaker-change offsets are then added to that date. Separate audio
-files do not automatically inherit the date chosen for an earlier file.
+When evidence is insufficient to justify a correction, the provisional geometry/header mapping is preserved.
 
 ## Prerequisites
 
@@ -290,31 +176,34 @@ files do not automatically inherit the date chosen for an earlier file.
 - EasyOCR
 - OpenCV
 - NumPy
-- PyPDF2 or pypdf
-- PyTorch appropriate for the selected device
-- MOSS Transcribe-Diarize
-- Transformers, Accelerate, SoundFile, and Requests for audio processing
+- PyPDF2
+- the Python `ollama` package
 
-A compatible GPU is recommended for practical local vision and audio inference.
+A GPU is recommended for practical vision-model processing, but the pipeline can also use CPU-backed OCR where supported.
 
 ## Installation
 
 Clone the repository:
 
 ```bash
-git clone https://github.com/it2023049/kmodelc-transcript-extractor.git
-cd kmodelc-transcript-extractor
+git clone https://github.com/it2023049/KModelC-Griphia.git
+cd KModelC-Griphia
 ```
 
-Create and activate a virtual environment:
+Create a virtual environment:
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
+```
+
+Upgrade pip:
+
+```bash
 python3 -m pip install --upgrade pip
 ```
 
-Install the core dependencies:
+Install the chat dependencies:
 
 ```bash
 python3 -m pip install \
@@ -322,27 +211,18 @@ python3 -m pip install \
   easyocr \
   numpy \
   ollama \
-  PyPDF2 \
-  torch \
-  transformers \
-  accelerate \
-  soundfile \
-  requests
+  PyPDF2
 ```
 
-Install MOSS Transcribe-Diarize:
+If the repository includes a matching `requirements.txt`, you can use:
 
 ```bash
-python3 -m pip install \
-  "moss-transcribe-diarize @ git+https://github.com/OpenMOSS/MOSS-Transcribe-Diarize.git"
+python3 -m pip install -r requirements.txt
 ```
-
-Install a PyTorch build compatible with your device before installing the audio
-dependencies when the default PyTorch package is not appropriate.
 
 ## Ollama Setup
 
-Pull the default model:
+Pull the model:
 
 ```bash
 ollama pull gemma3:12b
@@ -360,55 +240,205 @@ Start Ollama:
 ollama serve
 ```
 
-An alternate Ollama endpoint may be configured with:
+If needed, configure a custom Ollama host:
 
 ```bash
 export OLLAMA_HOST=http://127.0.0.1:11434
 ```
 
-## Quick Start
+## Dependency Check
 
-Run all commands from the repository root.
-
-### ZIP package with an explicit case report
+A lightweight import check:
 
 ```bash
-python3 chat/mass_extract.py \
+python3 -c "import cv2, easyocr, ollama, PyPDF2, numpy; print('chat dependencies ok')"
+```
+
+## Input Data
+
+The pipeline accepts:
+
+- a ZIP package
+- a folder
+- one or more screenshot files
+- a PDF/TXT case report supplied explicitly
+
+Supported image extensions:
+
+```text
+.png
+.jpg
+.jpeg
+.webp
+.bmp
+.tif
+.tiff
+```
+
+Supported case-report extensions:
+
+```text
+.pdf
+.txt
+```
+
+The case report is used to:
+
+- identify valid human participants
+- recover aliases and contact details
+- constrain sender/receiver attribution
+- understand communication relationships
+- provide timeline/context information
+- distinguish active participants from third parties
+
+## Output Format
+
+All final merged transcripts use:
+
+```csv
+"Timestamp","Estimated_Timestamp","Sender","Receiver","Message"
+```
+
+`Estimated_Timestamp` records whether the timestamp was directly derived from
+visible source evidence (`False`) or whether part of it was deterministically
+estimated by the pipeline (`True`). Only Facebook rows whose
+seconds were generated to preserve visual message order are marked `True`.
+
+### Strict Message-only LLM pass
+
+After all supported screenshots have been extracted, `mass_extract.py` runs a
+strict Ollama cleanup pass over the `Message` field before writing the final
+merged CSV.
+
+The pass is limited to obvious OCR corrections such as:
+
+- broken word order, for example `doing today? How are you` → `How are you doing today?`
+- spacing errors
+- capitalization and punctuation errors
+- obvious whitespace inside a website, URL, domain, or email identifier
+
+The following values are immutable during this pass:
+
+- `Timestamp`
+- `Estimated_Timestamp`
+- `Sender`
+- `Receiver`
+- row count and row order
+
+The model is not allowed to paraphrase, summarize, translate, add or remove
+words, change names or numbers, or split and merge rows. Every proposed edit is
+checked deterministically before it is accepted. Changes that alter lexical
+content or protected identifiers are rejected.
+
+If an LLM batch fails, all edits from the pass are rolled back. The final CSV is
+still written with the original extracted messages, the run is reported as
+`PARTIAL FAILURE`, and the process returns a non-zero exit code.
+
+The pass is enabled by default and uses `--model` unless a separate
+`--chat-polish-model` is supplied. It can be disabled explicitly with:
+
+```bash
+python3 mass_extract.py evidence_package.zip --no-chat-polish
+```
+
+By default, no additional pre-LLM CSV is created. To retain one for audit or
+comparison, provide its path explicitly:
+
+```bash
+python3 mass_extract.py evidence_package.zip \
+  --raw-chat-output results/before_llm.csv
+```
+
+### Viber timestamps
+
+Visible Viber message times are normalized to:
+
+```text
+DD/MM/YYYY HH:MM:SS
+```
+
+When the source UI does not show seconds, `:00` is added. Because the
+Viber timestamp itself is extracted from the visible chat UI, the pipeline writes
+`Estimated_Timestamp=False` for Viber rows.
+
+### Facebook Messenger timestamps
+
+Facebook screenshots may expose a screen-level or group-level visible time rather than a timestamp for every individual bubble.
+
+The extractor keeps each visible minute-level timestamp as an observed anchor.
+The anchor row keeps `:00` and is written with `Estimated_Timestamp=False`.
+If later Facebook rows would otherwise have the same or an earlier minute-level
+timestamp, the extractor adds deterministic one-second increments only to
+preserve bubble order. Those generated-second rows are written with
+`Estimated_Timestamp=True`.
+
+Example:
+
+```csv
+"Timestamp","Estimated_Timestamp","Sender","Receiver","Message"
+"12/03/2026 10:15:00","False","Alice Example","Bob Example","Hello Bob."
+"12/03/2026 10:15:01","True","Bob Example","Alice Example","Hi Alice."
+"12/03/2026 10:15:02","True","Alice Example","Bob Example","How are you?"
+```
+
+## Quick Start
+
+All commands below assume the current directory contains:
+
+```text
+mass_extract.py
+facebook_extract.py
+viber_extract.py
+extractor_utils.py
+```
+
+### ZIP package with explicit case report
+
+```bash
+python3 mass_extract.py \
   evidence_package.zip \
   --case-report case_reports/case_report.pdf \
   --results-dir results \
   --model gemma3:12b
 ```
 
-### Package with an auto-discovered case report
+### Package with auto-discovered case report
+
+If the package contains a recognizable PDF/TXT case report:
 
 ```bash
-python3 chat/mass_extract.py evidence_package.zip
+python3 mass_extract.py evidence_package.zip
 ```
 
 ### Folder input
 
 ```bash
-python3 chat/mass_extract.py evidence_folder/
+python3 mass_extract.py evidence_folder/
 ```
 
-### Explicit report followed by multiple evidence paths
+### Legacy explicit-report mode
 
 ```bash
-python3 chat/mass_extract.py \
+python3 mass_extract.py \
   case_reports/case_report.pdf \
-  evidence/facebook/ \
-  evidence/viber/ \
-  evidence/audio/ \
-  evidence/email/
+  evidence_package.zip
 ```
 
-## Standalone Extraction
+Multiple evidence paths may also be supplied:
+
+```bash
+python3 mass_extract.py \
+  case_reports/case_report.pdf \
+  evidence/facebook/ \
+  evidence/viber/
+```
+
+## Single-Image Extraction
 
 ### Facebook Messenger
 
 ```bash
-python3 chat/facebook_extract.py \
+python3 facebook_extract.py \
   images/example_facebook.png \
   case_reports/case_report.pdf \
   --model gemma3:12b \
@@ -421,7 +451,7 @@ python3 chat/facebook_extract.py \
 ### Viber
 
 ```bash
-python3 chat/viber_extract.py \
+python3 viber_extract.py \
   images/example_viber.png \
   case_reports/case_report.pdf \
   --model gemma3:12b \
@@ -431,197 +461,330 @@ python3 chat/viber_extract.py \
   --debug-dir results/example_viber_debug
 ```
 
-### Email
+### OCR-only mode
+
+Disable direct vision-model image input while retaining OCR processing:
 
 ```bash
-python3 email/email_extract.py \
-  images/example_email.png \
+python3 facebook_extract.py \
+  images/example_facebook.png \
   case_reports/case_report.pdf \
-  --model gemma3:12b \
-  --langs en \
-  --output results/example_email.csv \
-  --debug-dir results/example_email_debug
+  --no-vision
 ```
 
-### Audio
-
-```bash
-python3 speech/audio_diarize.py \
-  audio/example_call.mp3 \
-  --case-report case_reports/case_report.pdf \
-  --output-dir results/audio \
-  --backend moss-local \
-  --ollama-model gemma3:12b
-```
+OCR-only mode may reduce GPU use but can reduce text, layout, and bubble-boundary accuracy.
 
 ## Platform Classification
 
-`chat/mass_extract.py` provides three modes:
+`mass_extract.py` supports three routing modes:
 
-| Mode       | Behavior                                                                                              |
-| ---------- | ----------------------------------------------------------------------------------------------------- |
-| `auto`     | Inspects image content first and uses filename/path evidence when the visual classifier is uncertain. |
-| `vision`   | Uses visual classification and falls back to filename/path evidence when needed.                      |
-| `filename` | Uses filename and folder hints only.                                                                  |
+| Mode       | Behavior                                                                       |
+| ---------- | ------------------------------------------------------------------------------ |
+| `auto`     | Uses filename/path hints first and falls back to the vision model when needed. |
+| `filename` | Uses filename/path hints only.                                                 |
+| `vision`   | Uses the vision model first, then falls back to filename/path hints.           |
 
-The platform can also be forced when every candidate image belongs to one known
-type:
+Recognized chat platforms are:
 
-```bash
---force-platform facebook
---force-platform viber
---force-platform email
+```text
+facebook
+viber
 ```
 
-## Useful Batch Options
+Email and other unsupported images are skipped.
 
-| Option                      | Purpose                                                                         |
-| --------------------------- | ------------------------------------------------------------------------------- |
-| `--case-report PATH`        | Override automatic case-report discovery.                                       |
-| `--output PATH`             | Set the final merged CSV path.                                                  |
-| `--results-dir PATH`        | Set the output root directory.                                                  |
-| `--manifest PATH`           | Write a JSON run manifest.                                                      |
-| `--classify-mode MODE`      | Select `auto`, `vision`, or `filename` classification.                          |
-| `--force-platform TYPE`     | Force `facebook`, `viber`, or `email`.                                          |
-| `--model MODEL`             | Set the Ollama classification/extraction model.                                 |
-| `--langs LANGS`             | Set EasyOCR languages.                                                          |
-| `--cpu`                     | Use CPU mode for OCR.                                                           |
-| `--no-vision`               | Disable direct image input inside the extractors.                               |
-| `--no-chat-polish`          | Disable strict post-chat `Message` cleanup.                                     |
-| `--chat-polish-model MODEL` | Set the message-cleanup model.                                                  |
-| `--keep-chat-stage-outputs` | Additionally retain `<package>_chat_raw.csv` and `<package>_chat_polished.csv`. |
-| `--keep-per-image`          | Keep intermediate image CSV files.                                              |
-| `--keep-audio-output`       | Keep audio intermediate files.                                                  |
-| `--debug`                   | Keep per-image debug directories.                                               |
-| `--dump-ocr`                | Save OCR artifacts.                                                             |
-| `--dump-draft`              | Save extraction drafts.                                                         |
-| `--dump-side-map`           | Save provisional and final side mappings.                                       |
-| `--audio-date DD/MM/YYYY`   | Override contextual audio-date selection.                                       |
-| `--audio-backend BACKEND`   | Select local or API-based MOSS processing.                                      |
-| `--audio-debug-json`        | Save detailed audio JSON artifacts.                                             |
-| `--keep-duplicates`         | Disable exact chat/email row deduplication.                                     |
-
-Use the built-in help for the complete option set:
+### Filename-only classification
 
 ```bash
-python3 chat/mass_extract.py --help
-python3 speech/audio_diarize.py --help
-python3 email/email_extract.py --help
+python3 mass_extract.py \
+  evidence_package.zip \
+  --classify-mode filename
 ```
 
-## Output Files
+### Force Facebook
 
-By default, the batch command retains only the final merged CSV:
+```bash
+python3 mass_extract.py \
+  evidence_folder/ \
+  --case-report case_reports/case_report.pdf \
+  --force-platform facebook
+```
+
+### Force Viber
+
+```bash
+python3 mass_extract.py \
+  evidence_folder/ \
+  --case-report case_reports/case_report.pdf \
+  --force-platform viber
+```
+
+Forced platform mode should only be used when all candidate screenshots belong to the selected application.
+
+## Useful Batch Flags
+
+| Flag                                     | Purpose                                                    |
+| ---------------------------------------- | ---------------------------------------------------------- |
+| `--case-report PATH`                     | Override automatic case-report discovery.                  |
+| `--output PATH`                          | Set the merged CSV path.                                   |
+| `--results-dir PATH`                     | Set the output root directory.                             |
+| `--manifest PATH`                        | Optionally write a JSON run manifest.                      |
+| `--classify-mode {auto,filename,vision}` | Select screenshot classification strategy.                 |
+| `--force-platform {auto,facebook,viber}` | Force all candidate screenshots to one supported platform. |
+| `--model MODEL`                          | Set the Ollama model.                                      |
+| `--chat-polish-model MODEL`              | Override the model used by the strict Message-only pass.   |
+| `--chat-polish-host URL`                 | Override the Ollama host used by the strict cleanup pass.  |
+| `--chat-polish-batch-size N`             | Set rows per cleanup request (default `20`, maximum `50`). |
+| `--no-chat-polish`                       | Disable the strict post-extraction LLM pass.               |
+| `--raw-chat-output PATH`                 | Optionally retain the merged CSV before the LLM pass.      |
+| `--langs LANGS`                          | Set EasyOCR languages.                                     |
+| `--cpu`                                  | Force OCR CPU mode.                                        |
+| `--no-vision`                            | Disable direct image input to the extractor vision model.  |
+| `--emoji-mode omit`                      | Omit emojis from final chat text.                          |
+| `--emoji-mode vision`                    | Keep emojis judged clearly visible by the vision model.    |
+| `--debug`                                | Retain per-image debug directories.                        |
+| `--keep-per-image`                       | Retain intermediate per-image CSVs.                        |
+| `--dump-ocr`                             | Save OCR artifacts.                                        |
+| `--dump-draft`                           | Save intermediate extraction drafts.                       |
+| `--dump-side-map`                        | Save provisional/final side mappings.                      |
+| `--keep-duplicates`                      | Disable exact final-row deduplication.                     |
+| `--facebook-script PATH`                 | Override `facebook_extract.py`.                            |
+| `--viber-script PATH`                    | Override `viber_extract.py`.                               |
+| `--extra-extractor-arg VALUE`            | Forward an extra argument to chat extractors.              |
+
+## Collage Handling
+
+Automatic collage splitting is attempted first.
+
+For standalone extraction, manual layout flags can be used when automatic splitting is unreliable.
+
+### Fixed grid
+
+```bash
+--grid 2x1
+```
+
+Example:
+
+```bash
+python3 facebook_extract.py \
+  images/collage.png \
+  case_reports/case_report.pdf \
+  --grid 2x1 \
+  --output results/collage.csv \
+  --debug-dir results/collage_debug
+```
+
+### Uneven row layout
+
+```bash
+--layout 2,3
+```
+
+Use either `--grid` or `--layout`, not both.
+
+## Internal Conversation-State Cache
+
+During a batch run, the pipeline can maintain a temporary continuity cache containing the last accepted `LEFT`/`RIGHT` mapping for each platform and evidence-folder conversation key.
+
+This is only a **soft prior**.
+
+Current-image evidence remains authoritative, including:
+
+- a different visible contact
+- explicit self-identification
+- an exact speaker label
+- strong direct-address evidence
+- a participant pair incompatible with the cached mapping
+
+The orchestrator passes internal arguments such as:
+
+```text
+--conversation-state-cache
+--conversation-key
+```
+
+Users normally do not need to provide these manually.
+
+The cache is temporary and should not be committed.
+
+## Output Retention
+
+By default, the batch pipeline writes the final merged CSV directly. It does
+not create a separate pre-LLM CSV or run manifest unless the corresponding
+arguments are supplied.
+
+Use debug/retention flags when detailed review is needed:
+
+```bash
+--keep-per-image
+--debug
+--dump-ocr
+--dump-draft
+--dump-side-map
+```
+
+To retain the transcript immediately before the strict LLM pass, use:
+
+```bash
+--raw-chat-output results/before_llm.csv
+```
+
+A retained output tree may look like:
 
 ```text
 results/
 ├── extracted/
-└── <package>_merged.csv
+├── per_image/
+│   ├── <image>_extracted.csv
+│   └── <image>_debug/
+├── <optional_pre_llm>.csv
+├── <package_stem>_merged.csv
+└── <run_manifest>.json
 ```
-
-Use `--keep-chat-stage-outputs` when the pre- and post-LLM chat snapshots are
-needed for debugging, evaluation, or ablation comparisons:
-
-```bash
-python3 chat/mass_extract.py evidence_package.zip \
-  --case-report case_reports/report.pdf \
-  --keep-chat-stage-outputs
-```
-
-The retained CSV files will then be:
-
-```text
-results/
-├── <package>_chat_raw.csv
-├── <package>_chat_polished.csv
-└── <package>_merged.csv
-```
-
-The `per_image/`, `per_audio/`, and manifest entries remain optional and require
-their corresponding retention options. Supplying `--raw-chat-output` or
-`--polished-chat-output` with a custom path also enables retention of both chat
-stage CSVs.
-
-## Status and Failure Semantics
-
-- `[SUCCESS]` means every required stage completed and the final CSV was
-  written.
-- `[PARTIAL FAILURE]` means a final CSV was written, but at least one required
-  image, audio, email, attribution, date-selection, or cleanup stage was
-  incomplete.
-- a non-zero exit status is returned for partial or complete failure.
-- recognized non-conversation evidence is skipped and is not counted as a
-  failure.
 
 ## Troubleshooting
 
-### Case report cannot be discovered
+### Case report cannot be auto-discovered
 
-Supply it explicitly:
+If you see:
+
+```text
+Could not auto-discover a case report/overview PDF or TXT in the input package.
+```
+
+supply the report explicitly:
 
 ```bash
-python3 chat/mass_extract.py \
+python3 mass_extract.py \
   evidence_package.zip \
   --case-report case_reports/case_report.pdf
 ```
 
-### Unknown or incorrect screenshot platform
+### Conversation-state argument mismatch
 
-Use clear `facebook`, `messenger`, `viber`, or `email` filename/folder hints, or
-compare:
+If an extractor reports:
+
+```text
+unrecognized arguments: --conversation-state-cache --conversation-key
+```
+
+use all four files from the same code package:
+
+```text
+mass_extract.py
+facebook_extract.py
+viber_extract.py
+extractor_utils.py
+```
+
+Do not mix files from different code packages.
+
+### Missing `extractor_utils.py`
+
+Verify:
+
+```text
+mass_extract.py
+facebook_extract.py
+viber_extract.py
+extractor_utils.py
+```
+
+are kept together in the same directory.
+
+### Unknown screenshot platform
+
+Use recognizable filename/folder terms such as:
+
+```text
+facebook
+messenger
+viber
+```
+
+or use:
 
 ```bash
---classify-mode auto
---classify-mode filename
 --classify-mode vision
 ```
 
-Use a forced platform only when all candidate screenshots use the same
-application.
+### Ollama connection error
+
+Verify:
+
+```bash
+ollama list
+```
+
+and make sure the server is running:
+
+```bash
+ollama serve
+```
+
+Check the configured host:
+
+```bash
+echo "$OLLAMA_HOST"
+```
+
+If only the strict Message cleanup should use another endpoint, provide:
+
+```bash
+--chat-polish-host http://127.0.0.1:11434
+```
+
+### Strict Message-only pass reports a partial failure
+
+The final CSV is written with the original extracted messages because all LLM
+changes are rolled back when a batch fails. Verify that the selected model is
+installed, Ollama is reachable, and the requested batch fits the available
+resources. A smaller batch may help:
+
+```bash
+--chat-polish-batch-size 10
+```
+
+For audit or comparison during a retry, request the optional pre-LLM CSV:
+
+```bash
+--raw-chat-output results/before_llm.csv
+```
 
 ### Incorrect sender or receiver
 
-Retain the attribution evidence:
+Run the affected screenshot with:
 
 ```bash
---dump-side-map --dump-ocr --dump-draft --keep-per-image
+--dump-side-map --dump-ocr --dump-draft
 ```
 
 Review:
 
-- provisional and final participant mappings
-- visible header/contact evidence
+- provisional/final `LEFT`/`RIGHT` mapping
+- OCR header/contact evidence
 - bubble geometry
-- direct-address and self-identification cues
+- direct-address cues
+- self-identification
+- speaker prefixes
 - third-party mentions
-- conversation-continuity influence
+- continuity-cache influence
 
-### Audio timestamps are unavailable
+### Missing or incorrect chat date
 
-MOSS output must contain complete and monotonic start/end timestamps. Inspect
-the retained audio artifacts with:
-
-```bash
---keep-audio-output --audio-debug-json
-```
-
-The pipeline does not generate synthetic replacement offsets when the MOSS
-output remains malformed after retry.
-
-### Audio date cannot be established
-
-The date-selection model may only choose from dates observed in the case report
-or extracted chats. Use `--audio-date DD/MM/YYYY` only when an explicit,
-externally verified date is available.
-
-### Ollama connection error
-
-Verify the model and server:
+Use:
 
 ```bash
-ollama list
-ollama serve
+--dump-ocr --dump-draft
 ```
+
+Check whether:
+
+- the visible date separator was detected
+- status-bar clocks were excluded
+- the year was recovered correctly
+- the current screenshot rather than an earlier screenshot supplied the date
 
 ### Excessive OCR errors
 
@@ -629,23 +792,27 @@ Try:
 
 - a higher-resolution source
 - one screenshot instead of a collage
-- the correct OCR languages
-- retained OCR and draft artifacts
-- visual extraction instead of OCR-only mode
+- a manual collage layout
+- the correct EasyOCR languages
+- vision mode instead of OCR-only mode
+- retained OCR/draft artifacts for review
 
-Avoid adding evidence-specific replacement rules to shared extraction code.
+Avoid adding case-specific text-replacement rules to shared extraction code.
 
 ## Reproducibility
 
-For reproducible evaluation:
+For reproducible runs:
 
-- use fixed model and dependency versions
-- use deterministic model temperature where supported
-- retain a run manifest
-- preserve the original evidence separately
-- do not modify source screenshots or recordings before extraction
-- compare the final CSV with every original source
-- document any manual corrections separately
+- use a fixed Ollama model build
+- keep model temperature deterministic where configured
+- record Python and package build identifiers
+- retain a run manifest where needed
+- preserve the original evidence package separately
+- retain the optional pre-LLM CSV when an audit trail is required
+- do not modify source screenshots before extraction
+- review the merged CSV against the source evidence
+
+The extractor output is intended to support review and should not replace human verification.
 
 ## Privacy and Repository Safety
 
@@ -654,64 +821,54 @@ Do not commit real evidence or private case material to a public repository.
 Do not publish:
 
 - real case reports
-- evidence packages
-- private screenshots or recordings
+- evidence ZIPs
+- private screenshots
 - generated transcripts from real cases
-- OCR dumps and extraction drafts
-- phone numbers or email addresses
+- OCR dumps
+- debug artifacts containing evidence
+- phone numbers
+- email addresses
 - account credentials
-- financial details
+- payment details
+- IP addresses
 - access tokens
 - model caches
 - execution logs containing evidence
 
-Publish only source code, documentation, synthetic examples, anonymized fixtures,
-and explicitly authorized test data.
+Only publish:
 
-Recommended `.gitignore` entries include:
+- code
+- documentation
+- synthetic examples
+- properly anonymized examples
+- explicitly authorized test data
 
-```gitignore
-.venv/
-__pycache__/
-*.py[cod]
-results/
-evidence/
-case_reports/
-*.zip
-*.log
-*.tmp
-.DS_Store
-```
+Generated output, cache, temporary, and evidence directories should be excluded using `.gitignore`.
 
 ## Limitations
 
-- This is a research prototype, not an evidence-acquisition system.
+- This is a research/prototype pipeline.
 - OCR may miss, reorder, merge, split, or incorrectly recognize visible text.
-- Vision-language models may misclassify evidence or alter message segmentation.
+- Vision-model extraction may alter message segmentation.
+- The strict Message-only pass is conservative and may leave complex OCR errors unchanged.
 - Sender/receiver attribution is evidence-constrained but not guaranteed.
-- A screenshot containing multiple conversations may violate the fixed-pair
-  assumption.
-- Conversation continuity may become invalid when the visible account owner or
-  participant pair changes.
-- Email body extraction may omit content when the screenshot is cropped or the
-  layout is highly structured.
-- Speaker diarization and transcription quality depend on audio quality,
-  overlap, noise, and model behavior.
-- Separate audio files may contain overlapping speech and therefore require
-  review for duplicate content.
-- Contextual audio dates are estimates and must remain marked accordingly.
-- The final CSV must be reviewed against the original evidence before use.
+- A screenshot containing multiple unrelated conversations may violate the fixed-pair assumption.
+- A changing screenshot owner may invalidate conversation continuity.
+- Collage boundaries may be detected incorrectly.
+- Messenger timestamps may represent screen-level rather than message-level time.
+- Filename/path classification depends on sensible evidence organization.
+- The final CSV should be manually reviewed before being treated as final evidence.
 
-For faster iteration, test one representative screenshot, one recording, one
-email, and the associated report before processing a large package.
+For faster iteration, test:
 
-## Related Projects
+1. one representative screenshot
+2. the associated case report
+3. one small evidence package
 
-- [forensic-chat-screenshot-extractor](https://github.com/it2023049/forensic-chat-screenshot-extractor)
-- [chat-screenshot-and-audio-to-csv-extractor](https://github.com/it2023049/chat-screenshot-and-audio-to-csv-extractor)
-- [MOSS Transcribe-Diarize](https://github.com/OpenMOSS/MOSS-Transcribe-Diarize)
+before processing a complete dataset.
 
 ## License
 
-This project is licensed under the Apache License 2.0. See [LICENSE](LICENSE) for
-the full license text.
+This project is licensed under the Apache License 2.0.
+
+See the [LICENSE](LICENSE) file for details.
