@@ -1943,6 +1943,7 @@ Hard rules:
 5. Reorder words only when the current OCR order is plainly broken, e.g. "doing today? How are you" -> "How are you doing today?".
 6. If uncertain, return the original message exactly.
 7. Treat every website, URL, domain, and email address as one indivisible identifier. Never insert spaces inside it; remove only obvious OCR whitespace around '.', '/', ':', '@', or its top-level domain.
+8. Never add or remove any punctuation marks that is not clearly an OCR error. 
 
 Return JSON only: {"items":[{"id":1,"message":"..."}]}.
 """
