@@ -2,6 +2,8 @@
 
 import sys
 import re
+from extractor_utils import repair_screen_literals
+
 import csv
 import io
 import json
@@ -790,6 +792,8 @@ OCR BLOCKS:
 VIBER BUBBLE HINTS FROM OCR GEOMETRY:
 {bubble_hints or "No reliable Viber bubble hints."}
 
+Transcribe verbatim: preserve tense and contracted versus expanded forms. Never replace a phrase with an equivalent meaning.
+
 Return only CSV with this header exactly once:
 "Time","Side","Message"
 
@@ -906,6 +910,8 @@ VIBER BUBBLE HINTS:
 
 CURRENT SIDE CSV:
 {side_csv}
+
+Transcribe verbatim: preserve tense and contracted versus expanded forms. Never replace a phrase with an equivalent meaning.
 
 Return only CSV with this header exactly once:
 "Time","Side","Message"
@@ -2038,6 +2044,14 @@ def process_viber_image(
                 if polished_choice != chosen:
                     chosen_source += "+row_polish"
                 chosen = polished_choice
+
+        if use_vision and count_data_rows(chosen) > 0:
+            chosen = repair_screen_literals(
+                chosen, parse_ocr_lines(screen_ocr), crop_path, model,
+                debug_path=output_debug_dir / f"screen_{idx:02d}_literal_repairs.json" if dump_draft else None,
+                emoji_mode=emoji_mode, emoji_filter=strip_emojis,
+                whole_bubble=False,
+            )
 
         # Final timestamp policy for Viber: keep visible per-bubble minutes and
         # add zero seconds to every row.

@@ -8,6 +8,8 @@ chronologically sorted CSV using the public schema:
 Timestamp, Estimated_Timestamp, Sender, Receiver, Message.
 """
 
+from extractor_utils import CREDENTIAL, change_kind, wording_changed, punctuation_signature, typography_key
+
 import argparse
 from collections import Counter
 import csv
@@ -1698,6 +1700,19 @@ def repair_broken_identifiers(message: str) -> str:
     """Repair OCR whitespace/noise only inside unmistakable web/email identifiers."""
     value = str(message or "")
 
+    # Normalize split scheme separators only before a recognizable domain.
+    gap = r"[^\S\r\n]*"
+    label = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+    host = rf"{label}(?:\.{label})*"
+    value = re.sub(
+        rf"\b(https?){gap}:{gap}/{gap}/{gap}"
+        rf"(?={host}(?:{gap}\.{gap}|[^\S\r\n]+)"
+        rf"(?:{COMMON_IDENTIFIER_TLDS})(?![A-Za-z0-9_-]))",
+        lambda match: match.group(1).lower() + "://",
+        value,
+        flags=re.I,
+    )
+
     # OCR frequently reads the colon/slashes in ``https://`` as ``Il`` or
     # vertical bars. Restrict this repair to a following host plus known TLD.
     value = re.sub(
@@ -1857,9 +1872,9 @@ def _is_obvious_wrapped_clause_rotation(original: str, proposed: str) -> bool:
     return False
 
 def safe_message_only_edit(original: str, proposed: str) -> Tuple[bool, str]:
-    """Accept only corrections that cannot add or remove lexical content.
+    """Accept bounded message edits, including one hypothesized missing I.
 
-    Allowed edits are casing, punctuation, whitespace, and reordering of the
+    Allowed edits are casing, typography, whitespace, one missing I, and reordering of the
     exact same tokens.  This accepts corrections such as
     ``doing today? How are you`` -> ``How are you doing today?`` while rejecting
     paraphrases, new facts, deleted words, changed numbers, and changed URLs.
@@ -1872,12 +1887,24 @@ def safe_message_only_edit(original: str, proposed: str) -> Tuple[bool, str]:
         return True, "unchanged"
     if _protected_message_values(before) != _protected_message_values(after):
         return False, "protected number/URL/email changed"
+    if CREDENTIAL.findall(before) != CREDENTIAL.findall(after):
+        return False, "credential requires source verification"
+    if wording_changed(before, after):
+        return False, "contraction or tense rewrite requires source verification"
+    if punctuation_signature(before) != punctuation_signature(after):
+        return False, "punctuation addition/deletion/replacement requires source verification"
+    repair = change_kind(before, after)
+    if repair in {"missing_I", "adjacent_word_order", "wrapped_word_order"}:
+        return True, repair + " (text-only hypothesis)"
     before_tokens = _message_tokens(before)
     after_tokens = _message_tokens(after)
     if not before_tokens or not after_tokens:
         return False, "no lexical tokens"
     if before_tokens == after_tokens:
-        return True, "same token sequence"
+        compact = lambda text: re.sub(r"\s+", "", typography_key(text)).casefold()
+        if compact(before) != compact(after):
+            return False, "punctuation relocation requires source verification"
+        return True, "same token sequence and punctuation placement"
     if (
         Counter(before_tokens) == Counter(after_tokens)
         and _is_obvious_wrapped_clause_rotation(before, after)
@@ -1930,6 +1957,9 @@ def strict_polish_chat_messages(
     client = ollama.Client(host=normalize_http_base_url(host))
     accepted = 0
     rejected = 0
+    changes = []
+    rejection_reasons = Counter()
+    rejected_changes = []
     batch_size = max(1, min(int(batch_size or 20), 50))
 
     prompt_rules = """You are performing a STRICT forensic transcript cleanup.
@@ -1941,9 +1971,11 @@ Hard rules:
 3. Do not paraphrase, summarize, translate, complete, or improve style.
 4. Preserve every word/token, name, number, amount, phone number, URL, email, and factual claim.
 5. Reorder words only when the current OCR order is plainly broken, e.g. "doing today? How are you" -> "How are you doing today?".
-6. If uncertain, return the original message exactly.
+6. If uncertain, return the original message exactly. Preserve contracted versus expanded forms and verb tense; never paraphrase.
+6a. You may restore one standalone capital I when context strongly supports an omitted first-person subject. Preserve every existing word in order; do not turn imperatives into first-person statements.
+6b. You may swap one adjacent pair of words only if OCR order is plainly broken and the correction preserves who did what. Never change a credential; !/l ambiguities require the image stage.
 7. Treat every website, URL, domain, and email address as one indivisible identifier. Never insert spaces inside it; remove only obvious OCR whitespace around '.', '/', ':', '@', or its top-level domain.
-8. Never add or remove any punctuation marks that is not clearly an OCR error. 
+8. Preserve punctuation. Never add, delete or replace punctuation based on grammar or style; you have no image evidence. Straight/curly quote style and .../… are equivalent. When word order is unchanged, keep punctuation in its original position. For an allowed word reorder, preserve the existing punctuation marks in sequence. 
 
 Return JSON only: {"items":[{"id":1,"message":"..."}]}.
 """
@@ -1981,22 +2013,27 @@ Return JSON only: {"items":[{"id":1,"message":"..."}]}.
                 row_id = start + offset + 1
                 proposed = str(by_id[row_id].get("message", ""))
                 original = row.get("Message", "")
-                allowed, _ = safe_message_only_edit(original, proposed)
+                allowed, reason = safe_message_only_edit(original, proposed)
                 if allowed:
                     if proposed.strip() != str(original).strip():
                         row["Message"] = proposed.strip()
                         accepted += 1
+                        changes.append({"id":row_id,"before":original,"after":proposed.strip(),"reason":reason})
                 else:
                     rejected += 1
+                    rejection_reasons[reason] += 1
+                    rejected_changes.append({"id":row_id,"before":original,"proposed":proposed,"reason":reason})
         except Exception as exc:
             return {
                 "ok": False,
                 "accepted": accepted,
                 "rejected": rejected,
                 "error": f"batch {start // batch_size + 1}: {exc}",
+                "changes": changes, "rejection_reasons": dict(rejection_reasons), "rejected_changes": rejected_changes,
             }
 
-    return {"ok": True, "accepted": accepted, "rejected": rejected, "error": ""}
+    return {"ok": True, "accepted": accepted, "rejected": rejected, "error": "",
+            "changes": changes, "rejection_reasons": dict(rejection_reasons), "rejected_changes": rejected_changes}
 
 def invalid_chat_participant_labels(rows: Sequence[Dict[str, str]]) -> List[str]:
     """Return generic report/UI headings that leaked into chat identities."""

@@ -2,6 +2,8 @@
 
 import sys
 import re
+from extractor_utils import repair_screen_literals, visual_line_order
+
 import csv
 import io
 import json
@@ -820,14 +822,7 @@ def build_messenger_bubble_groups(screen_ocr: str) -> List[Dict[str, str]]:
     groups: List[Dict[str, str]] = []
 
     for group in raw_groups:
-        group_sorted = sorted(
-            group,
-            key=lambda r: (
-                to_int(r.get("y", "0")),
-                to_int(r.get("x", "0")),
-                to_int(r.get("block", "0")),
-            )
-        )
+        group_sorted = visual_line_order(group)
 
         side_scores = {"LEFT": 0, "RIGHT": 0}
         for r in group_sorted:
@@ -894,6 +889,8 @@ OCR BLOCKS:
 
 MESSENGER BUBBLE HINTS FROM OCR GEOMETRY:
 {bubble_hints or "No reliable bubble hints."}
+
+Transcribe verbatim: preserve tense and contracted versus expanded forms. Never replace a phrase with an equivalent meaning.
 
 Return only CSV with this header exactly once:
 "Time","Side","Message"
@@ -1023,6 +1020,8 @@ MESSENGER BUBBLE HINTS:
 
 CURRENT SIDE CSV:
 {side_csv}
+
+Transcribe verbatim: preserve tense and contracted versus expanded forms. Never replace a phrase with an equivalent meaning.
 
 Return only CSV with this header exactly once:
 "Time","Side","Message"
@@ -2184,6 +2183,14 @@ def process_facebook_image(
                     expected_bubble_count=expected_bubbles,
                     bubble_groups=messenger_bubble_groups,
                 )
+
+        if use_vision and count_data_rows(chosen) > 0:
+            chosen = repair_screen_literals(
+                chosen, parse_ocr_lines(screen_ocr), crop_path, model,
+                debug_path=output_debug_dir / f"screen_{idx:02d}_literal_repairs.json" if dump_draft else None,
+                emoji_mode=emoji_mode, emoji_filter=strip_emojis,
+                whole_bubble=True,
+            )
 
         # Final timestamp policy for Facebook/Messenger: first row uses :00,
         # later rows in the same screen advance deterministically by one second.
