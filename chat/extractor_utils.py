@@ -3692,11 +3692,11 @@ def project_source_edit(before, source, allow_fragment=False):
             candidates.add((candidate, 'glyph_dollar_s'))
     if candidates:
         return next(iter(candidates)) if len(candidates) == 1 else (before, '')
-    if _v4_enabled('KMODELC_MULTI_I'):
+    if _v4_enabled('TRANSCRIPT_EXTRACTOR_MULTI_I'):
         candidate, kind = _v4_multi_i(before, source)
         if kind:
             return candidate, kind
-    if _v4_enabled('KMODELC_VISUAL_PUNCTUATION'):
+    if _v4_enabled('TRANSCRIPT_EXTRACTOR_VISUAL_PUNCTUATION'):
         return _v4_punctuation(before, source)
     return before, ''
 
@@ -3794,7 +3794,7 @@ def repair_screen_literals(side_csv, blocks, image_path, model, debug_path=None,
             'a plausible password. Do not paraphrase, improve grammar or expand contractions. '
             'Return JSON {"message":"exact text", "one_bubble":true, "legible":true}. '
             'If more than one message is present or any character is uncertain, set the flags false.')
-    if _v4_enabled('KMODELC_VISUAL_PUNCTUATION'):
+    if _v4_enabled('TRANSCRIPT_EXTRACTOR_VISUAL_PUNCTUATION'):
         prompt += (' Preserve every visible sentence punctuation mark, including dot counts. '
                    'Do not infer punctuation from grammar. If punctuation is unclear, set legible false.')
     with tempfile.TemporaryDirectory(prefix='literal_read_') as temp:

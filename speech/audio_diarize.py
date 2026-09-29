@@ -51,8 +51,8 @@ DEFAULT_MOSS_PROMPT = (
 def normalize_http_base_url(value: str, default: str = "http://127.0.0.1:11434") -> str:
     """Return a requests-compatible HTTP(S) base URL.
 
-    HPC job scripts commonly export ``OLLAMA_HOST=127.0.0.1:<port>``.  The
-    Ollama Python client accepts that form, but ``requests`` does not, so add
+    ``OLLAMA_HOST`` may omit an HTTP scheme. The Ollama Python client accepts
+    that form, but ``requests`` does not, so add
     the scheme deterministically before Stage-2 attribution starts.
     """
     text = str(value or default).strip().rstrip("/")
@@ -151,7 +151,7 @@ class MossLocalRunner:
                 "  cd MOSS-Transcribe-Diarize\n"
                 "  python -m pip install -e .\n"
                 "  python -m pip install transformers accelerate soundfile\n"
-                "For CUDA, install a Torch build compatible with your HPC CUDA libraries."
+                "For CUDA, install a Torch build compatible with your GPU driver."
             ) from exc
 
         self._build_transcription_messages = build_transcription_messages

@@ -1,4 +1,4 @@
-# KModelC Transcript Extractor
+# Transcript Extractor
 
 A Python toolkit for extracting communication evidence from Facebook Messenger and Viber screenshots, email screenshots, and audio recordings.
 
@@ -27,7 +27,7 @@ This is a research tool. Extracted transcripts and participant assignments requi
 ## Repository Structure
 
 ```text
-kmodelc-transcript-extractor/
+<repository-directory>/
 ├── .github/
 │   └── workflows/
 │       └── python-check.yml
@@ -99,7 +99,11 @@ Extracts email evidence from supported screenshots for inclusion in the merged t
 
 ### `speech/audio_diarize.py`
 
-Runs MOSS transcription and speaker diarization, with optional Ollama-assisted participant attribution using the case report.
+Runs MOSS transcription and speaker diarization. For participant attribution,
+the optional Ollama pass analyzes the case report and the complete anonymous
+speaker-turn transcript. It keeps a stable identity for each speaker label
+within a recording and checks conflicting self-identification before assigning
+names. A recipient may remain `Unknown` when evidence is insufficient.
 
 ### `speech/audio_utils.py`
 
@@ -132,11 +136,11 @@ Model downloads may require internet access during initial setup.
 
 ## Installation
 
-Clone the repository:
+Clone the repository using the URL copied from its GitHub page:
 
 ```bash
-git clone https://github.com/it2023049/kmodelc-transcript-extractor.git
-cd kmodelc-transcript-extractor
+git clone <repository-url>
+cd <repository-directory>
 ```
 
 Create and activate a virtual environment:
@@ -385,15 +389,15 @@ Apostrophes, quotation marks, and hyphens are outside this pass's allowed punctu
 
 The following features are enabled by default:
 
-| Environment variable           | Function                                                       |
-| ------------------------------ | -------------------------------------------------------------- |
-| `KMODELC_MULTI_I=1`            | Permit recovery of multiple omitted standalone `I` tokens.     |
-| `KMODELC_VISUAL_PUNCTUATION=1` | Permit source-image-verified sentence-punctuation corrections. |
+| Environment variable                        | Function                                                       |
+| ------------------------------------------- | -------------------------------------------------------------- |
+| `TRANSCRIPT_EXTRACTOR_MULTI_I=1`            | Permit recovery of multiple omitted standalone `I` tokens.     |
+| `TRANSCRIPT_EXTRACTOR_VISUAL_PUNCTUATION=1` | Permit source-image-verified sentence-punctuation corrections. |
 
 Disable a feature by setting its value to `0`:
 
 ```bash
-KMODELC_VISUAL_PUNCTUATION=0 \
+TRANSCRIPT_EXTRACTOR_VISUAL_PUNCTUATION=0 \
 python3 chat/mass_extract.py \
   evidence_package.zip \
   --case-report case_reports/report.pdf
@@ -457,7 +461,12 @@ Third-party mentions are not automatically treated as evidence of the current sp
 
 The batch pipeline may retain a temporary conversation-state cache for screenshots from the same evidence folder. This supplies a continuity prior; current-image evidence may override it.
 
-Audio attribution uses diarized speaker labels, transcription content, and case context. Ambiguous or incorrect assignments remain possible and require review.
+Audio attribution uses diarized speaker labels, transcription content, and case
+context. It checks stable speaker identities and uses direct address, explicit
+self-identification, and relevant interactions to validate proposed names.
+During merging, an additional pass can revisit `Unknown` audio identities using
+related chat evidence, the case report, and substantial transcript overlap.
+Ambiguous or incorrect assignments remain possible and require review.
 
 ## Output Format
 
