@@ -44,7 +44,6 @@ class ConversationTurn:
     end: Optional[float] = None
 
 
-
 # =============================================================================
 # TEXT AND IDENTITY NORMALIZATION
 # =============================================================================
@@ -53,7 +52,6 @@ def normalize_space(text: str) -> str:
     text = text.replace("\u00a0", " ")
     text = re.sub(r"\s+", " ", text)
     return text.strip()
-
 
 def strip_parenthetical_alias(value: str) -> str:
     """Remove complete or truncated trailing parenthetical aliases.

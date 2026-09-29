@@ -1614,6 +1614,202 @@ def remove_exact_rows_within_audio_candidate(candidate: AudioCandidate) -> int:
     candidate.rows = kept
     return removed
 
+def resolve_audio_overlaps(candidates: Sequence[AudioCandidate]) -> List[Dict[str, str]]:
+    """Fill unknown identities from one unambiguous overlapping recording.
+
+    Require an identical long word sequence, a fully identified donor, and no
+    contradictory known field. Estimated recording dates are not evidence of
+    identity. Keep every source row and its transcription unchanged.
+    """
+    decisions: List[Dict[str, str]] = []
+    donors = [
+        (candidate, row)
+        for candidate in candidates for row in candidate.rows
+        if all(not is_unresolved_audio_participant(row.get(field, ""))
+               for field in ("Sender", "Receiver"))
+    ]
+    for candidate in candidates:
+        for row in candidate.rows:
+            unknown = [field for field in ("Sender", "Receiver")
+                       if is_unresolved_audio_participant(row.get(field, ""))]
+            if not unknown:
+                continue
+            target = normalize_audio_transcript_text(row.get("Message", ""))
+            matches = []
+            for donor_candidate, donor in donors:
+                if donor_candidate is candidate:
+                    continue
+                evidence = normalize_audio_transcript_text(donor.get("Message", ""))
+                shorter, longer = sorted((target, evidence), key=len)
+                # A long, exact consecutive word span avoids matching common
+                # greetings or repeated case-report vocabulary.
+                if len(shorter.split()) < 20 or shorter not in longer:
+                    continue
+                if any(
+                    not is_unresolved_audio_participant(row.get(field, ""))
+                    and str(row[field]).strip().casefold() != str(donor[field]).strip().casefold()
+                    for field in ("Sender", "Receiver")
+                ):
+                    continue
+                matches.append((donor_candidate, donor))
+            if len(matches) != 1:
+                continue
+            source, donor = matches[0]
+            if donor["Sender"].casefold() == donor["Receiver"].casefold():
+                continue
+            for field in unknown:
+                row[field] = donor[field]
+            decisions.append({
+                "target_audio": str(candidate.source_audio),
+                "reference_audio": str(source.source_audio),
+                "fields": ",".join(unknown),
+                "method": "unique_contiguous_transcript_overlap",
+            })
+    return decisions
+
+def refine_unknown_audio_attribution(
+    candidates: Sequence[AudioCandidate],
+    chat_rows: Sequence[Dict[str, str]],
+    report_text: str,
+    model: str,
+    host: str,
+) -> List[Dict[str, str]]:
+    """Reconsider unresolved audio identities after chat-aware date inference.
+
+    A model chooses among evidence-backed pairs, but an exact, distinctive
+    transcript overlap is required before its choice can change a row. The
+    inferred date is context, not proof of a person's identity.
+    """
+    decisions: List[Dict[str, str]] = []
+    unresolved = [
+        (candidate, row)
+        for candidate in candidates for row in candidate.rows
+        if any(is_unresolved_audio_participant(row.get(field, ""))
+               for field in ("Sender", "Receiver"))
+    ]
+    if not unresolved:
+        return decisions
+    try:
+        import ollama
+        client = ollama.Client(host=normalize_http_base_url(host))
+    except Exception as exc:
+        return [{"status": "unavailable", "reason": str(exc)}]
+
+    def overlapping_words(a: str, b: str) -> int:
+        """Length of the longest common consecutive word sequence."""
+        left = normalize_audio_transcript_text(a).split()
+        right = normalize_audio_transcript_text(b).split()
+        if not left or not right:
+            return 0
+        matcher = SequenceMatcher(None, left, right, autojunk=False)
+        return max((match.size for match in matcher.get_matching_blocks()), default=0)
+
+    for candidate, row in unresolved:
+        # Exact audio overlaps can correct an incorrectly filled counterpart;
+        # short chat overlaps can only fill fields that are still unknown.
+        evidence: List[Dict[str, Any]] = []
+        for other in candidates:
+            if other is candidate:
+                continue
+            for other_row in other.rows:
+                if any(is_unresolved_audio_participant(other_row.get(field, ""))
+                       for field in ("Sender", "Receiver")):
+                    continue
+                shared = overlapping_words(row["Message"], other_row["Message"])
+                if shared >= 20:
+                    evidence.append({
+                        "type": "audio", "sender": other_row["Sender"],
+                        "receiver": other_row["Receiver"], "shared_words": shared,
+                        "message": other_row["Message"],
+                        "source": str(other.source_audio),
+                    })
+        for chat in chat_rows:
+            if chat.get("_source_kind") != "chat":
+                continue
+            if any(is_unresolved_audio_participant(chat.get(field, ""))
+                   for field in ("Sender", "Receiver")):
+                continue
+            shared = overlapping_words(row["Message"], chat.get("Message", ""))
+            if shared >= 8:
+                evidence.append({
+                    "type": "chat", "sender": chat["Sender"],
+                    "receiver": chat["Receiver"], "shared_words": shared,
+                    "message": chat["Message"],
+                    "date": chat.get("Timestamp", ""),
+                    "source": chat.get("_source_csv", ""),
+                })
+        evidence.sort(key=lambda item: (-item["shared_words"], item["type"], item["source"]))
+        evidence = evidence[:16]
+        if not evidence:
+            continue
+        pairs = {(item["sender"], item["receiver"]) for item in evidence}
+        if len(pairs) != 1:
+            # A model cannot adjudicate contradictory literal evidence.
+            continue
+        proposed_sender, proposed_receiver = next(iter(pairs))
+        if proposed_sender.casefold() == proposed_receiver.casefold():
+            continue
+        conflicting = [
+            field for field in ("Sender", "Receiver")
+            if not is_unresolved_audio_participant(row.get(field, ""))
+            and row[field].casefold() != (proposed_sender if field == "Sender" else proposed_receiver).casefold()
+        ]
+        if conflicting and not any(item["type"] == "audio" for item in evidence):
+            continue
+        # Let the LLM consider the case report, transcript, and date-matched
+        # chat context. Its answer must still point to one supplied evidence ID.
+        report_tokens = _audio_date_context_tokens(row["Message"])
+        passages = [p.strip() for p in re.split(r"\n\s*\n", report_text) if p.strip()]
+        passages.sort(key=lambda p: len(report_tokens & _audio_date_context_tokens(p)), reverse=True)
+        report_context = "\n\n".join(passages[:8])[:12000]
+        references = [
+            {"id": index, **{**item, "message": item["message"][:500]}}
+            for index, item in enumerate(evidence, start=1)
+        ]
+        prompt = f"""Review ONE unresolved audio speaker attribution using the case report and independent transcript evidence.
+Return JSON only: {{"sender":"name or Unknown","receiver":"name or Unknown","reference_id":1,"reason":"brief"}}.
+Choose a pair only if its attribution is supported by the report context and the referenced transcript.
+The audio date is estimated and must not by itself determine identity. A person mentioned in speech is not necessarily the speaker or recipient. Do not use the filename as identity evidence. If ambiguous, return Unknown.
+
+AUDIO TRANSCRIPT: {row['Message']}
+ESTIMATED DATE: {row.get('Timestamp', '')}
+CURRENT ATTRIBUTION: {row.get('Sender', '')} -> {row.get('Receiver', '')}
+RELATED CHAT CONTEXT: {build_audio_date_chat_context([row], chat_rows, max_dates=4, max_rows_per_date=4)[:7000]}
+REPORT CONTEXT: {report_context}
+LITERAL TRANSCRIPT REFERENCES: {json.dumps(references, ensure_ascii=False)[:16000]}
+"""
+        try:
+            response = client.chat(
+                model=model, messages=[{"role": "user", "content": prompt}],
+                format="json", options={"temperature": 0},
+            )
+            answer = _parse_json_object(response["message"]["content"])
+            reference_id = int(answer.get("reference_id", 0))
+        except Exception as exc:
+            decisions.append({"status": "error", "source_audio": str(candidate.source_audio),
+                              "source_row": row.get("_source_row", ""), "reason": str(exc)})
+            continue
+        cited = next((item for item in references if item["id"] == reference_id), None)
+        if (cited is None or answer.get("sender") != proposed_sender
+                or answer.get("receiver") != proposed_receiver
+                or (conflicting and cited["type"] != "audio")):
+            continue
+        changed = []
+        for field, value in (("Sender", proposed_sender), ("Receiver", proposed_receiver)):
+            if row[field] != value:
+                changed.append(field)
+                row[field] = value
+        if changed:
+            decisions.append({
+                "status": "resolved", "source_audio": str(candidate.source_audio),
+                "source_row": row.get("_source_row", ""),
+                "fields": ",".join(changed), "reference_type": cited["type"],
+                "reference_source": cited["source"],
+                "shared_words": str(cited["shared_words"]),
+                "reason": str(answer.get("reason", ""))[:400],
+            })
+    return decisions
+
 def deduplicate_audio_candidates(
     candidates: List[AudioCandidate],
     enabled: bool = True,
@@ -2634,7 +2830,7 @@ def main() -> int:
     keep_per_image = bool(args.keep_per_image or keep_debug)
     temporary_per_image_workspace: Optional[tempfile.TemporaryDirectory[str]] = None
     temporary_audio_workspace: Optional[tempfile.TemporaryDirectory[str]] = None
-    temporary_case_context_workspace: Optional[tempfile.TemporaryDirectory[str]] = tempfile.TemporaryDirectory(prefix="kmodelc_case_context_")
+    temporary_case_context_workspace: Optional[tempfile.TemporaryDirectory[str]] = tempfile.TemporaryDirectory(prefix="tool_case_context_")
     case_context_cache = Path(temporary_case_context_workspace.name) / "case_context.json"
 
     # Chat continuity is deliberately separate from the audio case graph.  It
@@ -3003,10 +3199,21 @@ def main() -> int:
                 record["status"] = "empty"
                 record["reason"] = "audio CSV contained no mergeable dated rows"
 
+        audio_context_decisions = refine_unknown_audio_attribution(
+            audio_candidates,
+            chat_rows,
+            report_text_for_audio_dates,
+            args.audio_ollama_model or args.model,
+            args.audio_ollama_host or args.chat_polish_host
+            or os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434"),
+        )
+        audio_overlap_decisions = resolve_audio_overlaps(audio_candidates)
         selected_audio_rows, audio_dedupe_summary = deduplicate_audio_candidates(
             audio_candidates,
             enabled=not args.keep_duplicates,
         )
+        audio_dedupe_summary["attribution_from_overlap"] = audio_overlap_decisions
+        audio_dedupe_summary["attribution_from_context"] = audio_context_decisions
         all_rows.extend(selected_audio_rows)
         print(
             "[INFO] Audio deduplication: "

@@ -1283,7 +1283,10 @@ def build_final_turns_from_attribution(
             self_identified_participant(turn.message, allowed_names) or "" for turn in speaker_turns
         ])
         explicit_ids = [value for value in explicit_ids if value]
-        if len(explicit_ids) == 1:
+        if len(explicit_ids) > 1:
+            # One diarized speaker cannot be two self-identified people.
+            speaker_map[speaker] = "Unknown"
+        elif len(explicit_ids) == 1:
             speaker_map[speaker] = explicit_ids[0]
         elif single_speaker and filename_sender:
             speaker_map[speaker] = filename_sender
@@ -1332,16 +1335,8 @@ def build_final_turns_from_attribution(
         record_confidence = _record_confidence(record)
         sender = speaker_map.get(turn.speaker, "Unknown") or "Unknown"
 
+        # Do not change a speaker's identity halfway through the recording.
         explicit_sender = self_identified_participant(turn.message, allowed_names)
-        if explicit_sender:
-            sender = explicit_sender
-            speaker_map[turn.speaker] = sender
-
-        # If the stable sender is still unknown, a medium/high per-turn record
-        # may identify it, but low-confidence guesses are ignored.
-        if sender == "Unknown" and record_confidence in {"high", "medium"}:
-            record_sender = canonical_participant_name(str(record.get("sender", "")), allowed_names)
-            sender = record_sender or "Unknown"
 
         direct_receivers = [
             value for value in directly_addressed_participants(turn.message, allowed_names)
